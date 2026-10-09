@@ -543,15 +543,32 @@ class PlaywrightExecutor:
             )
 
         if target_url.startswith("#"):
-            await page.evaluate(f"window.location.hash = '{target_url}'")
+            hash_part = target_url.lstrip("#")
+            await page.evaluate(f"""() => {{
+                if (typeof navigateTo === 'function') {{
+                    navigateTo('{hash_part}');
+                }} else {{
+                    window.location.hash = '{target_url}';
+                }}
+            }}""")
             await page.wait_for_timeout(100)
         else:
+            hash_part = ""
             if not urllib.parse.urlparse(target_url).scheme:
                 file_part, sep, hash_part = target_url.partition("#")
                 candidate = (MOCK_SITE_DIR / file_part) if file_part else None
                 if candidate and candidate.exists():
                     target_url = f"file:///{(candidate).as_posix()}{sep}{hash_part}"
+            else:
+                _, sep, hash_part = target_url.partition("#")
+
             await page.goto(target_url, wait_until="domcontentloaded", timeout=DEFAULT_ACTION_TIMEOUT_MS * 2)
+            if hash_part:
+                await page.evaluate(f"""() => {{
+                    if (typeof navigateTo === 'function') {{
+                        navigateTo('{hash_part}');
+                    }}
+                }}""")
             await page.wait_for_timeout(100)
 
         current_url = page.url
