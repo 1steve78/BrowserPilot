@@ -167,10 +167,7 @@ async def test_scenario_2_update_setting_repeated_runs(uvicorn_server):
 
 @pytest.mark.asyncio
 async def test_scenario_3_stop_execution_live_control(uvicorn_server):
-    """Scenario 3: Start multi-action task, press Stop while running, verify no subsequent action starts."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        await client.post(f"{uvicorn_server}/resume")
-
+    """Scenario 3: Start multi-action task, press Stop while running, verify no subsequent action starts (repeated 3x)."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
@@ -179,38 +176,47 @@ async def test_scenario_3_stop_execution_live_control(uvicorn_server):
         await page.goto(dashboard_url, wait_until="domcontentloaded")
         await page.wait_for_selector("#backend-status-text:has-text('ONLINE')", timeout=8000)
 
-        # Select Scenario 3 Stop preset
-        await page.click("#preset-stop")
-        await page.wait_for_timeout(200)
+        for run_idx in range(1, 4):
+            # Ensure fresh resumed state before run
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(f"{uvicorn_server}/resume")
+            await page.wait_for_timeout(200)
 
-        # Click Run Task
-        await page.click("#btn-run")
+            # Select Scenario 3 Stop preset
+            await page.click("#preset-stop")
+            await page.wait_for_timeout(200)
 
-        # Wait until task transitions to RUNNING
-        await page.wait_for_selector("#agent-status-text:has-text('RUNNING')", timeout=5000)
+            # Click Run Task
+            await page.click("#btn-run")
 
-        # Immediately trigger Stop
-        await page.click("#btn-stop")
+            # Wait until task transitions to RUNNING
+            await page.wait_for_selector("#agent-status-text:has-text('RUNNING')", timeout=5000)
 
-        # Confirm dashboard transitions to STOPPED
-        await page.wait_for_function(
-            "() => document.getElementById('agent-status-text')?.textContent.trim() === 'STOPPED'",
-            timeout=8000,
-        )
-        final_status = await page.inner_text("#agent-status-text")
-        assert final_status == "STOPPED"
+            # Trigger Stop mid-flight
+            await page.click("#btn-stop")
 
-        # Verify backend stop flag is active and rejects direct execution
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            subsequent = await client.post(
-                f"{uvicorn_server}/execute",
-                json={"action": "click", "target": "nav-dashboard"},
+            # Confirm dashboard transitions to STOPPED
+            await page.wait_for_function(
+                "() => document.getElementById('agent-status-text')?.textContent.trim() === 'STOPPED'",
+                timeout=8000,
             )
-            assert subsequent.json()["success"] is False
-            assert "stopped" in subsequent.json()["error"].lower()
+            final_status = await page.inner_text("#agent-status-text")
+            assert final_status == "STOPPED", f"Run {run_idx}: Expected STOPPED status"
 
-            # Restore normal state
-            await client.post(f"{uvicorn_server}/resume")
+            # Wait for client loop to settle and verify no further action begins
+            await page.wait_for_timeout(1000)
+
+            # Verify backend stop flag is active and rejects subsequent direct execution
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                subsequent = await client.post(
+                    f"{uvicorn_server}/execute",
+                    json={"action": "click", "target": "nav-dashboard"},
+                )
+                assert subsequent.json()["success"] is False, f"Run {run_idx}: Subsequent action must be blocked"
+                assert "stopped" in subsequent.json()["error"].lower()
+
+                # Cleanly resume before next cycle
+                await client.post(f"{uvicorn_server}/resume")
 
         await browser.close()
 
@@ -240,7 +246,7 @@ async def test_prompt_injection_security_defense(uvicorn_server):
 
 @pytest.mark.asyncio
 async def test_stale_element_ids_after_navigation(uvicorn_server):
-    """Check that element IDs do not leak across inactive pages after navigation."""
+    """Check that element IDs do not leak across inactive pages and cannot be interacted with."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.post(f"{uvicorn_server}/resume")
 
@@ -274,14 +280,22 @@ async def test_stale_element_ids_after_navigation(uvicorn_server):
         assert "settings-profile-name" in set_ids
         assert "invoice-search" not in set_ids, "invoice-search must not be visible on settings page"
 
+        # 4. Attempting to execute an action against a stale element from inactive page fails cleanly
+        stale_click = await client.post(
+            f"{uvicorn_server}/execute",
+            json={"action": "click", "target": "quick-create-invoice-btn"},
+        )
+        assert stale_click.json()["success"] is False
+        assert "not visible" in stale_click.json()["error"].lower() or "not found" in stale_click.json()["error"].lower()
+
 
 @pytest.mark.asyncio
 async def test_error_handling_and_timeout_resilience(uvicorn_server):
-    """Verify invalid targets produce structured errors without crashing the API server."""
+    """Verify invalid targets and action timeouts produce structured errors without crashing server."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.post(f"{uvicorn_server}/resume")
 
-        # Missing target produces clean structured error
+        # 1. Missing target produces clean structured error
         err_res = await client.post(
             f"{uvicorn_server}/execute",
             json={"action": "click", "target": "non-existent-button-xyz-999"},
@@ -291,7 +305,17 @@ async def test_error_handling_and_timeout_resilience(uvicorn_server):
         assert data["success"] is False
         assert "not found" in data["error"].lower()
 
-        # Server remains alive and functional for subsequent valid actions
+        # 2. Bounded wait action timeout produces clean structured error without hanging
+        timeout_res = await client.post(
+            f"{uvicorn_server}/execute",
+            json={"action": "wait", "target": "unmatched-element-999", "seconds": 1.0},
+        )
+        assert timeout_res.status_code == 200
+        timeout_data = timeout_res.json()
+        assert timeout_data["success"] is False
+        assert "timeout" in timeout_data["error"].lower() or "not found" in timeout_data["error"].lower()
+
+        # 3. Server remains alive and functional for subsequent health check and actions
         health = await client.get(f"{uvicorn_server}/health")
         assert health.status_code == 200
         assert health.json()["status"] == "ok"

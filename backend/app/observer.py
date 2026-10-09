@@ -91,6 +91,12 @@ class PlaywrightObserver:
         """Navigate the active browser page to the specified URL."""
         target_page = self._resolve_page(None)
         await target_page.goto(url, wait_until="domcontentloaded")
+        if "#" in url:
+            hash_part = url.split("#", 1)[1]
+            try:
+                await target_page.evaluate(f"if (typeof window.navigateTo === 'function') window.navigateTo('{hash_part}')")
+            except Exception:
+                pass
 
     def _resolve_page(self, page: Optional[Page]) -> Page:
         active_page = page or self.page

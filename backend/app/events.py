@@ -76,7 +76,7 @@ class EventManager:
         dead_connections = []
         for connection in connections:
             try:
-                await connection.send_text(payload_json)
+                await asyncio.wait_for(connection.send_text(payload_json), timeout=1.0)
             except Exception:
                 dead_connections.append(connection)
 

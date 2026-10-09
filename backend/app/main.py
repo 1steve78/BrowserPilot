@@ -13,9 +13,12 @@ Owned by: Browser Automation Engineer (Member B)
 
 import asyncio
 from contextlib import asynccontextmanager
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -141,6 +144,8 @@ async def observe_browser():
 @app.post("/execute", response_model=ExecutionResult)
 async def execute_action(request: ExecuteActionRequest):
     """Accept one validated browser action, execute it through executor.py, and return actual result."""
+    events_to_emit: List[Dict[str, Any]] = []
+
     async with get_browser_lock():
         # Check stop state before executing
         if executor.is_stopped:
@@ -170,15 +175,15 @@ async def execute_action(request: ExecuteActionRequest):
             )
             safety_check = safety_guard.evaluate_action(browser_act)
             if not safety_check.is_safe:
-                await event_manager.emit(
-                    EventType.SAFETY_ALERT,
-                    message=f"Action blocked by SafetyGuard: {safety_check.reason}",
-                    data={
+                events_to_emit.append({
+                    "type": EventType.SAFETY_ALERT,
+                    "message": f"Action blocked by SafetyGuard: {safety_check.reason}",
+                    "data": {
                         "action": act_type.value if hasattr(act_type, "value") else str(act_type),
                         "target": request.target,
                         "reason": safety_check.reason,
                     },
-                )
+                })
                 result = ExecutionResult(
                     success=False,
                     action_type=ActionType.FAIL,
@@ -189,39 +194,50 @@ async def execute_action(request: ExecuteActionRequest):
                 )
             else:
                 result = await executor.execute(request)
-                if result.success and executor.current_page and not executor.current_page.is_closed():
+                # Check for prompt injections on navigation / page changes
+                is_nav = act_type in (ActionType.NAVIGATE, "navigate") or bool(request.url)
+                if result.success and is_nav and executor.current_page and not executor.current_page.is_closed():
                     try:
-                        current_obs = await observer.observe(executor.current_page)
+                        current_obs = await asyncio.wait_for(observer.observe(executor.current_page), timeout=2.0)
                         injections = safety_guard.inspect_observation(current_obs)
                         if injections:
                             for inj in injections:
-                                await event_manager.emit(
-                                    EventType.SAFETY_ALERT,
-                                    message=f"Prompt injection detected on page: {inj.reason}",
-                                    data={
+                                events_to_emit.append({
+                                    "type": EventType.SAFETY_ALERT,
+                                    "message": f"Prompt injection detected on page: {inj.reason}",
+                                    "data": {
                                         "reason": inj.reason,
                                         "pattern": inj.flagged_pattern,
                                         "url": executor.current_page.url,
                                     },
-                                )
-                    except Exception:
-                        pass
+                                })
+                            result.message = f"{result.message} [SAFETY ALERT: {injections[0].reason}]"
+                    except Exception as exc:
+                        logger.warning(f"Safety inspection on page observation failed or timed out: {exc}")
 
-        # Record event telemetry in event manager
+    # Outside browser lock: emit collected events
+    for ev in events_to_emit:
         await event_manager.emit(
-            EventType.ACTION_EXECUTED,
-            message=result.message,
-            data={
-                "action": result.action or (result.action_type.value if hasattr(result.action_type, "value") else str(result.action_type)),
-                "target": result.target,
-                "success": result.success,
-                "status": "success" if result.success else "failure",
-                "error": result.error,
-                "duration_ms": result.duration_ms,
-            },
+            ev["type"],
+            message=ev["message"],
+            data=ev["data"],
         )
 
-        return result
+    # Record event telemetry in event manager
+    await event_manager.emit(
+        EventType.ACTION_EXECUTED,
+        message=result.message,
+        data={
+            "action": result.action or (result.action_type.value if hasattr(result.action_type, "value") else str(result.action_type)),
+            "target": result.target,
+            "success": result.success,
+            "status": "success" if result.success else "failure",
+            "error": result.error,
+            "duration_ms": result.duration_ms,
+        },
+    )
+
+    return result
 
 
 @app.get("/events")
