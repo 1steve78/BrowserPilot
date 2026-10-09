@@ -962,6 +962,9 @@
       const validPages = ['dashboard', 'invoices', 'customers', 'settings'];
       if (!validPages.includes(pageId)) pageId = 'dashboard';
 
+      // Dismiss any open modal overlay on route change
+      closeInvoiceModal();
+
       // Update page views
       document.querySelectorAll('.page-view').forEach(view => {
         view.classList.remove('active');
