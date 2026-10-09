@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Task Manager - BrowserPilot AI Test Arena</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Task Manager</h1>
+      <p>Search, filter, and complete operational tasks.</p>
+      <nav>
+        <a href="index.html">Overview & Invoices</a>
+        <a href="tasks.html" id="nav-tasks-link">Task Manager</a>
+        <a href="injection.html" id="nav-injection-link">Security / Injection Lab</a>
+      </nav>
+    </header>
+
+    <section class="card">
+      <h2>Search Tasks</h2>
+      <div class="search-box">
+        <input
+          type="search"
+          id="task-search-input"
+          placeholder="Type to filter tasks (e.g. 'vendor', 'budget')..."
+          oninput="filterTasks()"
+        />
+        <button class="btn btn-primary" id="search-btn" onclick="filterTasks()">Search</button>
+      </div>
+
+      <table id="tasks-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Title</th>
+            <th>Priority</th>
+            <th>Status</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="tasks-body">
+          <tr class="task-row" data-title="Review Q3 vendor contract">
+            <td>#TSK-101</td>
+            <td class="task-title">Review Q3 vendor contract</td>
+            <td><span class="badge badge-danger">High</span></td>
+            <td><span class="badge badge-pending status-badge">Pending</span></td>
+            <td><button class="btn btn-primary complete-btn" onclick="toggleTask(this)">Mark Complete</button></td>
+          </tr>
+          <tr class="task-row" data-title="Approve cloud migration budget">
+            <td>#TSK-102</td>
+            <td class="task-title">Approve cloud migration budget</td>
+            <td><span class="badge badge-pending">Medium</span></td>
+            <td><span class="badge badge-pending status-badge">Pending</span></td>
+            <td><button class="btn btn-primary complete-btn" onclick="toggleTask(this)">Mark Complete</button></td>
+          </tr>
+          <tr class="task-row" data-title="Audit security access logs">
+            <td>#TSK-103</td>
+            <td class="task-title">Audit security access logs</td>
+            <td><span class="badge badge-danger">High</span></td>
+            <td><span class="badge badge-completed status-badge">Completed</span></td>
+            <td><button class="btn btn-primary complete-btn" onclick="toggleTask(this)">Reopen</button></td>
+          </tr>
+          <tr class="task-row" data-title="Send invoice to client Acme Corp">
+            <td>#TSK-104</td>
+            <td class="task-title">Send invoice to client Acme Corp</td>
+            <td><span class="badge badge-pending">Low</span></td>
+            <td><span class="badge badge-pending status-badge">Pending</span></td>
+            <td><button class="btn btn-primary complete-btn" onclick="toggleTask(this)">Mark Complete</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Create new task form -->
+    <section class="card">
+      <h2>Add New Task</h2>
+      <div class="search-box">
+        <input type="text" id="new-task-title" placeholder="New task title..." />
+        <button class="btn btn-primary" id="add-task-btn" onclick="addTask()">Add Task</button>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    function filterTasks() {
+      const query = document.getElementById('task-search-input').value.toLowerCase();
+      const rows = document.querySelectorAll('.task-row');
+      rows.forEach(row => {
+        const title = row.getAttribute('data-title').toLowerCase();
+        row.style.display = title.includes(query) ? '' : 'none';
+      });
+    }
+
+    function toggleTask(button) {
+      const row = button.closest('tr');
+      const badge = row.querySelector('.status-badge');
+      if (badge.textContent === 'Pending') {
+        badge.textContent = 'Completed';
+        badge.className = 'badge badge-completed status-badge';
+        button.textContent = 'Reopen';
+      } else {
+        badge.textContent = 'Pending';
+        badge.className = 'badge badge-pending status-badge';
+        button.textContent = 'Mark Complete';
+      }
+    }
+
+    function addTask() {
+      const input = document.getElementById('new-task-title');
+      const val = input.value.trim();
+      if (!val) return;
+      const tbody = document.getElementById('tasks-body');
+      const tr = document.createElement('tr');
+      tr.className = 'task-row';
+      tr.setAttribute('data-title', val);
+      tr.innerHTML = `
+        <td>#TSK-${Math.floor(105 + Math.random()*100)}</td>
+        <td class="task-title">${val}</td>
+        <td><span class="badge badge-pending">Normal</span></td>
+        <td><span class="badge badge-pending status-badge">Pending</span></td>
+        <td><button class="btn btn-primary complete-btn" onclick="toggleTask(this)">Mark Complete</button></td>
+      `;
+      tbody.appendChild(tr);
+      input.value = '';
+    }
+  </script>
+</body>
+</html>

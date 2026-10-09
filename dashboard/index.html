@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BrowserPilot AI - Autonomous Browser Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="dashboard-container">
+    <header>
+      <div class="brand">
+        <h1>BrowserPilot AI</h1>
+        <span class="badge status-idle" id="agent-status-badge">
+          <span class="status-dot"></span>
+          <span id="agent-status-text">IDLE</span>
+        </span>
+      </div>
+      <div>
+        <span class="badge status-idle" id="ws-status-badge">
+          <span class="status-dot"></span>
+          <span id="ws-status-text">Connecting...</span>
+        </span>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- Left Column: Controls & Agent Brain State -->
+      <div style="display: flex; flex-direction: column; gap: 1.5rem;">
+        <!-- Run Controls Card -->
+        <section class="card">
+          <h2 class="card-title">Agent Goal & Controls</h2>
+          <div class="form-group">
+            <label for="goal-input">Natural Language Goal</label>
+            <textarea id="goal-input" rows="3" placeholder="e.g. Find the 'Review Q3 vendor contract' task and mark it completed."></textarea>
+          </div>
+
+          <div class="form-group">
+            <label for="url-input">Target URL</label>
+            <input type="text" id="url-input" value="http://localhost:8080/tasks.html" />
+          </div>
+
+          <div>
+            <label>Quick Presets</label>
+            <div class="presets">
+              <button class="preset-chip" onclick="setPreset('Find the Q3 vendor task and mark it complete.', 'http://localhost:8080/tasks.html')">
+                Complete Q3 Task
+              </button>
+              <button class="preset-chip" onclick="setPreset('Extract invoice number and due date for Acme Corporation.', 'http://localhost:8080/index.html')">
+                Extract Invoice
+              </button>
+              <button class="preset-chip" onclick="setPreset('Review comments and identify security risks.', 'http://localhost:8080/injection.html')">
+                Injection Audit
+              </button>
+              <button class="preset-chip" onclick="setPreset('Click the Purge Database button.', 'http://localhost:8080/index.html')">
+                Test Safety Blocker
+              </button>
+            </div>
+          </div>
+
+          <div class="button-group">
+            <button class="btn btn-start" id="btn-start" onclick="startAgent()">
+              Start Agent
+            </button>
+            <button class="btn btn-stop" id="btn-stop" onclick="stopAgent()" disabled>
+              Stop Agent
+            </button>
+          </div>
+        </section>
+
+        <!-- Current Cognitive Trace & Action Card -->
+        <section class="card">
+          <h2 class="card-title">Cognitive State & Last Action</h2>
+          <div class="thought-box">
+            <strong>Reflection</strong>
+            <p id="thought-reflection" style="color: var(--text-muted); font-style: italic;">No active run yet.</p>
+          </div>
+          <div class="thought-box">
+            <strong>Reasoning</strong>
+            <p id="thought-reasoning" style="color: var(--text-muted); font-style: italic;">Awaiting user goal...</p>
+          </div>
+          <div class="thought-box">
+            <strong>Proposed Action</strong>
+            <p id="thought-action" style="color: var(--text-muted); font-style: italic;">None</p>
+          </div>
+        </section>
+      </div>
+
+      <!-- Right Column: Live Event Timeline -->
+      <section class="card" style="display: flex; flex-direction: column;">
+        <div class="card-title">
+          <span>Live Event Timeline</span>
+          <div style="display: flex; gap: 0.5rem; align-items: center;">
+            <button class="preset-chip" onclick="clearTimeline()">Clear</button>
+          </div>
+        </div>
+        <div class="timeline" id="event-timeline">
+          <div class="timeline-item" style="border-left-color: var(--text-muted);">
+            <div class="timeline-header">
+              <span class="timeline-type" style="color: var(--text-muted);">SYSTEM</span>
+              <span class="timeline-time">Ready</span>
+            </div>
+            <div class="timeline-msg">Dashboard initialized. Enter a goal to start the browser pilot.</div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
