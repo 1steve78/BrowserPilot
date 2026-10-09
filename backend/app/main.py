@@ -1,24 +1,69 @@
 """FastAPI application entrypoint for BrowserPilot AI.
 
-Provides REST and WebSocket endpoints for dashboard communication,
-agent lifecycle management, and static file serving.
+Provides REST and WebSocket endpoints for:
+1. Health verification: GET /health
+2. Browser observation: GET /observe
+3. Browser action execution: POST /execute
+4. Execution event telemetry: GET /events
+5. Session flow control: POST /stop and POST /resume
+6. Dashboard communication and static mock-site serving
+
+Owned by: Browser Automation Engineer (Member B)
 """
 
 import asyncio
 from contextlib import asynccontextmanager
+import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .agent_loop import AgentLoop
-from .events import event_manager
-from .schemas import AgentRunRequest, AgentRunState, RunStatus
+from .events import EventType, event_manager
+from .executor import MOCK_SITE_DEFAULT_URL, PlaywrightExecutor
+from .observer import PlaywrightObserver
+from .schemas import (
+    ActionType,
+    AgentRunRequest,
+    AgentRunState,
+    ExecuteActionRequest,
+    ExecutionResult,
+    ObservationResponse,
+    RunStatus,
+    StopResponse,
+)
 
-# Global agent loop instance
-agent_loop = AgentLoop()
+# Concurrency lock to serialize all active browser operations
+_browser_lock: Optional[asyncio.Lock] = None
+_lock_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def get_browser_lock() -> asyncio.Lock:
+    """Return an asyncio.Lock bound to the current running event loop."""
+    global _browser_lock, _lock_loop
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.Lock()
+    if _browser_lock is None or _lock_loop != current_loop:
+        _browser_lock = asyncio.Lock()
+        _lock_loop = current_loop
+    return _browser_lock
+
+
+# Headless mode: defaults to True for backend service, configurable via env var
+HEADLESS_MODE = os.getenv("BROWSERPILOT_HEADLESS", "true").lower() in ("true", "1", "yes")
+
+# Core browser observer and executor singletons
+executor = PlaywrightExecutor(headless=HEADLESS_MODE)
+observer = PlaywrightObserver()
+
+# Global agent loop instance (Member A coordinator)
+agent_loop = AgentLoop(observer=observer, executor=executor)
 _active_task: Optional[asyncio.Task] = None
 
 
@@ -27,8 +72,11 @@ async def lifespan(app: FastAPI):
     """Lifecycle manager for startup and graceful shutdown."""
     yield
     # Cleanup browser resources on shutdown
-    if agent_loop and agent_loop.executor:
-        await agent_loop.executor.close()
+    async with get_browser_lock():
+        if executor:
+            await executor.close()
+        if observer:
+            await observer.close()
 
 
 app = FastAPI(
@@ -48,8 +96,124 @@ app.add_middleware(
 )
 
 
-@app.get("/api/health")
+# =====================================================================
+# STEP 4 REQUIRED ENDPOINTS
+# =====================================================================
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Redirect root path to interactive Swagger API documentation."""
+    return RedirectResponse(url="/docs")
+
+
+@app.get("/health")
 async def health_check():
+    """Confirm the API server is running."""
+    return {"status": "ok"}
+
+
+@app.get("/observe", response_model=ObservationResponse)
+async def observe_browser():
+    """Return the current page URL, title, and visible interactive elements using observer.py."""
+    async with get_browser_lock():
+        try:
+            # Ensure browser page is open and active
+            if not executor.current_page or executor.current_page.is_closed():
+                await executor.initialize()
+                await executor.execute({"action": "navigate", "url": MOCK_SITE_DEFAULT_URL})
+            elif executor.current_page.url in ("", "about:blank"):
+                await executor.execute({"action": "navigate", "url": MOCK_SITE_DEFAULT_URL})
+
+            page = executor.current_page
+            obs = await observer.observe_structured(page)
+
+            return ObservationResponse(
+                url=obs.get("url", ""),
+                title=obs.get("title", ""),
+                elements=obs.get("elements", []),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Observation failed: {str(exc)}")
+
+
+@app.post("/execute", response_model=ExecutionResult)
+async def execute_action(request: ExecuteActionRequest):
+    """Accept one validated browser action, execute it through executor.py, and return actual result."""
+    async with get_browser_lock():
+        # Check stop state before executing
+        if executor.is_stopped:
+            result = ExecutionResult(
+                success=False,
+                action_type=ActionType.FAIL,
+                action=request.action,
+                target=request.target,
+                message="Execution is stopped. Action blocked.",
+                error="Execution stopped",
+            )
+        else:
+            result = await executor.execute(request)
+
+        # Record event telemetry in event manager
+        await event_manager.emit(
+            EventType.ACTION_EXECUTED,
+            message=result.message,
+            data={
+                "action": result.action or (result.action_type.value if hasattr(result.action_type, "value") else str(result.action_type)),
+                "target": result.target,
+                "success": result.success,
+                "status": "success" if result.success else "failure",
+                "error": result.error,
+                "duration_ms": result.duration_ms,
+            },
+        )
+
+        return result
+
+
+@app.get("/events")
+async def get_action_events(limit: int = 50):
+    """Return recent browser action events, including timestamps, action names, and status."""
+    raw_events = event_manager.get_history(limit=limit)
+    formatted: List[Dict[str, Any]] = []
+    for ev in raw_events:
+        item = {
+            "event_id": ev.event_id,
+            "timestamp": ev.timestamp.isoformat(),
+            "type": ev.type.value if hasattr(ev.type, "value") else str(ev.type),
+            "message": ev.message,
+            "action": ev.data.get("action", ""),
+            "target": ev.data.get("target"),
+            "status": ev.data.get("status", "success" if ev.data.get("success") else "failure"),
+            "success": ev.data.get("success", False),
+            "error": ev.data.get("error"),
+            "duration_ms": ev.data.get("duration_ms", 0.0),
+            "data": ev.data,
+        }
+        formatted.append(item)
+    return formatted
+
+
+@app.post("/stop", response_model=StopResponse)
+async def stop_execution():
+    """Set stop flag to prevent subsequent actions in execution layer."""
+    executor.stop()
+    agent_loop.request_stop()
+    return StopResponse(status="stopped", message="Execution stopped")
+
+
+@app.post("/resume")
+async def resume_execution():
+    """Reset stop flag to resume allowing actions."""
+    executor.resume()
+    return {"status": "resumed", "message": "Execution resumed"}
+
+
+# =====================================================================
+# AGENT LIFECYCLE & LEGACY BACKWARD-COMPATIBLE ENDPOINTS
+# =====================================================================
+
+@app.get("/api/health")
+async def api_health_check():
     """Health status and service readiness check."""
     return {
         "status": "healthy",
@@ -81,6 +245,7 @@ async def stop_agent():
         return {"message": "Agent is not currently running"}
 
     agent_loop.request_stop()
+    executor.stop()
     return {"message": "Stop signal sent to agent"}
 
 
@@ -95,8 +260,8 @@ async def get_agent_state():
 
 
 @app.get("/api/events")
-async def get_recent_events(limit: int = 50):
-    """Retrieve recent event history."""
+async def get_recent_api_events(limit: int = 50):
+    """Retrieve recent event history (raw AgentEvent models)."""
     return [event.model_dump() for event in event_manager.get_history(limit=limit)]
 
 
