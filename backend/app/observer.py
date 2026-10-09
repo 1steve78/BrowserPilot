@@ -178,29 +178,23 @@ class PlaywrightObserver:
             for (let i = 0; i < candidates.length; i++) {
                 const el = candidates[i];
                 
-                // 1. Check direct computed visibility
-                const style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-                    continue;
+                // 1. Check direct & parent visibility natively
+                if (typeof el.checkVisibility === 'function') {
+                    if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) {
+                        continue;
+                    }
+                } else {
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                        continue;
+                    }
+                    if (el.offsetParent === null && style.position !== 'fixed') {
+                        continue;
+                    }
                 }
                 
                 const rect = el.getBoundingClientRect();
                 if (rect.width === 0 && rect.height === 0) {
-                    continue;
-                }
-                
-                // 2. Check if any parent container is hidden (e.g. inactive tab or hidden modal)
-                let parent = el.parentElement;
-                let isHiddenParent = false;
-                while (parent && parent !== document.body) {
-                    const pStyle = window.getComputedStyle(parent);
-                    if (pStyle.display === 'none' || pStyle.visibility === 'hidden') {
-                        isHiddenParent = true;
-                        break;
-                    }
-                    parent = parent.parentElement;
-                }
-                if (isHiddenParent) {
                     continue;
                 }
                 
