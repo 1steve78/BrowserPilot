@@ -19,6 +19,7 @@ import asyncio
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
+import re
 from typing import Any, Dict, List, Optional
 import uuid
 
@@ -71,9 +72,53 @@ def compute_observation_fingerprint(observation: PageObservation) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()[:16]
 
 
+# Regex patterns for explicit transaction/submission completion
+SUBMISSION_CONFIRMATION_PATTERNS = [
+    r"thank\s+you.*(?:submission|order|contacting|reaching\s+out|registering|signing\s+up|feedback)",
+    r"submission\s+(?:was\s+|has\s+been\s+)?(?:received|confirmed|successful)",
+    r"order\s+(?:was\s+|has\s+been\s+)?(?:confirmed|placed|received|completed)",
+    r"message\s+(?:was\s+|has\s+been\s+)?(?:sent|received)",
+    r"form\s+(?:was\s+|has\s+been\s+)?submitted",
+    r"successfully\s+submitted",
+    r"successfully\s+saved",
+    r"account\s+created",
+    r"registration\s+(?:was\s+)?(?:complete|successful)",
+    r"booking\s+confirmed",
+    r"reservation\s+confirmed",
+]
+
+CART_CONFIRMATION_PATTERNS = [
+    r"added\s+to\s+(?:your\s+)?cart",
+    r"item\s+added",
+    r"in\s+(?:your\s+)?cart",
+    r"cart\s*\([1-9]\d*\)",
+    r"cart:\s*[1-9]\d*",
+    r"[1-9]\d*\s+items?\s+in\s+cart",
+    r"proceed\s+to\s+checkout",
+]
+
+SEARCH_RESULT_PATTERNS = [
+    r"results?\s+for",
+    r"search\s+results?",
+    r"items?\s+found",
+    r"showing\s+results?",
+    r"products?\s+found",
+    r"matching\s+results?",
+    r"(?:no|0)\s+(?:results?|products?|items?)\s+found",
+]
+
+
 def is_action_grounded(action: BrowserAction, observation: PageObservation) -> bool:
-    """Verify that an action targeting an element has a selector grounded in the observation."""
-    if action.action_type not in (ActionType.CLICK, ActionType.TYPE, ActionType.EXTRACT):
+    """Verify that an action targeting an element has a selector grounded in the observation.
+
+    Prefers exact matches against structured `observation.interactive_elements`.
+    Rejects loose substring occurrences in DOM summary or page copy (e.g. 'button', 'input', '#e1').
+    """
+    if action.action_type not in (ActionType.CLICK, ActionType.TYPE, ActionType.EXTRACT, ActionType.PRESS_KEY):
+        return True
+
+    # Global keypress without target element is allowed
+    if action.action_type == ActionType.PRESS_KEY and not action.selector:
         return True
 
     if not action.selector:
@@ -82,17 +127,20 @@ def is_action_grounded(action: BrowserAction, observation: PageObservation) -> b
     sel = action.selector.strip()
     raw_sel_id = sel.lstrip("#")
 
-    # 1. Check interactive elements list
+    # 1. Exact match against structured interactive_elements fields
     for el in observation.interactive_elements:
-        if el.selector == sel:
+        if el.selector and el.selector.strip() == sel:
             return True
-        if el.id and (el.id == raw_sel_id or el.id == sel):
-            return True
+        if el.id:
+            clean_id = el.id.strip()
+            if sel == clean_id or sel == f"#{clean_id}" or raw_sel_id == clean_id:
+                return True
+            if sel == f'[data-agent-id="{clean_id}"]':
+                return True
 
-    # 2. Check DOM summary presence
-    if sel in observation.dom_summary:
-        return True
-    if raw_sel_id in observation.dom_summary:
+    # 2. Strict check for explicit selector declarations formatted in dom_summary
+    # Observer formats entries strictly as: `-> selector: `{el.selector}``
+    if observation.dom_summary and f"selector: `{sel}`" in observation.dom_summary:
         return True
 
     return False
@@ -102,33 +150,136 @@ def verify_task_completion(
     goal: str,
     finish_description: str,
     observation: PageObservation,
+    history: Optional[List[StepRecord]] = None,
 ) -> bool:
-    """Verify whether a model's finish claim is corroborated by page evidence.
-    
-    Never trusts model claim alone; looks for textual or state indicators
-    on the current page matching completion signals or goal keywords.
+    """Verify whether a model's finish claim is corroborated by credible page evidence.
+
+    Conservative verification rules:
+    - Never trusts model finish claim alone or isolated generic words.
+    - Rejects isolated words like 'complete', 'saved', 'cart', or 'success' that appear
+      in standard page copy, navigation headers, or footers.
+    - Distinguishes task types (state-changing, search, navigation, extraction) and requires
+      credible outcome evidence appropriate to the goal.
+    - Prefers unverified (False) when available evidence is ambiguous or insufficient.
     """
-    text_corpus = (
-        f"{observation.title} "
-        f"{observation.dom_summary} "
-        f"{observation.page_text_snippet or ''} "
-        f"{observation.url}"
-    ).lower()
+    if observation.error:
+        return False
 
-    # Universal positive outcome indicators
-    completion_indicators = [
-        "success", "succeeded", "completed", "complete", "confirmed",
-        "confirmation", "thank you", "paid", "submitted", "done",
-        "created", "saved", "verified"
-    ]
+    goal_lower = goal.lower().strip()
+    title_lower = observation.title.lower()
+    url_lower = observation.url.lower()
+    dom_lower = observation.dom_summary.lower()
+    snippet_lower = (observation.page_text_snippet or "").lower()
+    page_text = f"{title_lower} {snippet_lower} {dom_lower}"
 
-    has_indicator = any(ind in text_corpus for ind in completion_indicators)
+    # 1. State-changing / Transactional goals (cart, purchase, submit, register, delete)
+    state_changing_triggers = (
+        "cart", "buy", "purchase", "checkout", "submit", "fill",
+        "register", "sign up", "order", "book", "reserve", "delete",
+        "remove", "subscribe", "save", "contact", "send"
+    )
+    is_state_changing = any(trigger in goal_lower for trigger in state_changing_triggers)
 
-    # Goal keyword presence
-    goal_words = [w.lower() for w in goal.split() if len(w) > 3]
-    goal_words_present = any(w in text_corpus for w in goal_words) if goal_words else True
+    if is_state_changing:
+        # If execution history is provided, state-changing tasks cannot succeed with 0 executed steps
+        if history is not None and len(history) == 0:
+            return False
 
-    return has_indicator or goal_words_present
+        # Check for cart/checkout specific tasks
+        if any(c in goal_lower for c in ("cart", "buy", "purchase", "checkout")):
+            has_cart_evidence = any(
+                re.search(pat, page_text, re.IGNORECASE) for pat in CART_CONFIRMATION_PATTERNS
+            )
+            has_cart_route = any(r in url_lower for r in ("/cart", "/checkout/success", "/order-confirmed"))
+            if has_cart_evidence or has_cart_route:
+                return True
+            return False
+
+        # Check for form submission, registration, contact, booking, or saving
+        has_submission_evidence = any(
+            re.search(pat, page_text, re.IGNORECASE) for pat in SUBMISSION_CONFIRMATION_PATTERNS
+        )
+        has_submission_route = any(
+            r in url_lower for r in ("/thank-you", "/confirmation", "/success", "/submitted")
+        )
+        if has_submission_evidence or has_submission_route:
+            return True
+        return False
+
+    # 2. Search / Query / Lookup goals
+    search_triggers = ("search", "find", "look up", "filter")
+    is_search = any(trigger in goal_lower for trigger in search_triggers)
+
+    if is_search:
+        has_search_route = any(
+            p in url_lower for p in ("?q=", "?search=", "?query=", "&q=", "&search=", "/search?", "/results?")
+        )
+        has_result_pattern = any(
+            re.search(pat, page_text, re.IGNORECASE) for pat in SEARCH_RESULT_PATTERNS
+        )
+
+        stop_words = {"search", "for", "find", "look", "up", "the", "a", "an", "in", "on", "products", "item", "items", "table", "tasks"}
+        query_words = [w for w in re.findall(r"\w+", goal_lower) if len(w) > 2 and w not in stop_words]
+
+        # Corroborate client-side search/filter actions executed during the run
+        has_executed_search_action = False
+        if history:
+            for step in history:
+                if step.execution_result and step.execution_result.success:
+                    if step.action.action_type in (ActionType.TYPE, ActionType.CLICK):
+                        sel = (step.action.selector or "").lower()
+                        if "search" in sel or "filter" in sel or (step.action.text and any(qw in (step.action.text or "").lower() for qw in query_words)):
+                            has_executed_search_action = True
+                            break
+
+        if not (has_search_route or has_result_pattern or has_executed_search_action):
+            return False
+
+        if query_words:
+            query_in_page = any(qw in page_text or qw in url_lower for qw in query_words)
+            if not query_in_page:
+                return False
+
+        return True
+
+    # 3. Direct Navigation goals
+    nav_triggers = ("go to", "navigate to", "open", "visit")
+    is_nav = any(goal_lower.startswith(trigger) or f" {trigger} " in f" {goal_lower} " for trigger in nav_triggers)
+
+    if is_nav:
+        stop_words = {"go", "to", "navigate", "open", "visit", "the", "page", "section", "site"}
+        nav_targets = [w for w in re.findall(r"\w+", goal_lower) if len(w) > 2 and w not in stop_words]
+        if nav_targets:
+            target_in_url = any(f"/{t}" in url_lower or f"{t}." in url_lower for t in nav_targets)
+            target_in_title = any(t in title_lower for t in nav_targets)
+            if target_in_url or target_in_title:
+                return True
+            return False
+
+    # 4. Information extraction / Inquiry goals
+    extract_triggers = ("what is", "extract", "read", "get the", "find the price")
+    is_extract = any(trigger in goal_lower for trigger in extract_triggers)
+
+    if is_extract:
+        if finish_description and len(finish_description.strip()) > 5:
+            desc_words = [w for w in re.findall(r"\w+", finish_description.lower()) if len(w) > 3]
+            if desc_words and any(dw in page_text for dw in desc_words):
+                return True
+        return False
+
+    # 5. Fallback for unspecified task types:
+    has_explicit_outcome = any(
+        re.search(pat, page_text, re.IGNORECASE) for pat in SUBMISSION_CONFIRMATION_PATTERNS
+    )
+    if has_explicit_outcome:
+        substantive_goal_words = [
+            w for w in re.findall(r"\w+", goal_lower)
+            if len(w) > 3 and w not in {"with", "that", "this", "from", "page"}
+        ]
+        if not substantive_goal_words or any(gw in page_text for gw in substantive_goal_words):
+            return True
+
+    return False
 
 
 class ControlledAgentRunner:
@@ -296,8 +447,23 @@ class ControlledAgentRunner:
                 )
 
                 try:
+                    goal_for_step = request.goal
+                    if state.history:
+                        recent_actions_summary = "; ".join(
+                            f"Step {s.step_number}: {s.action.action_type.value}"
+                            + (f" '{s.action.text}'" if s.action.text else "")
+                            + (f" on {s.action.selector}" if s.action.selector else "")
+                            + (f" ({s.execution_result.message})" if s.execution_result else "")
+                            for s in state.history[-3:]
+                        )
+                        goal_for_step = (
+                            f"{request.goal}\n"
+                            f"[Context: Previous actions executed: {recent_actions_summary}. "
+                            "If the goal has already been achieved by previous actions or current page state, select action 'finish'.]"
+                        )
+
                     response = await self.model_client.get_next_action(
-                        goal=request.goal,
+                        goal=goal_for_step,
                         observation=observation,
                         step_number=step_idx,
                         max_steps=state.max_steps,
@@ -384,6 +550,7 @@ class ControlledAgentRunner:
                         request.goal,
                         proposed_action.description,
                         observation,
+                        history=state.history,
                     )
                     if is_verified:
                         stop_reason = StopReason.COMPLETED
@@ -440,8 +607,9 @@ class ControlledAgentRunner:
                 state.final_output = "Run stopped by user request."
             elif state.status == RunStatus.RUNNING and state.current_step >= state.max_steps:
                 stop_reason = StopReason.MAX_STEPS_REACHED
-                state.status = RunStatus.COMPLETED
-                state.final_output = f"Reached configured limit of {state.max_steps} actions."
+                state.status = RunStatus.FAILED
+                state.error = f"Maximum step limit of {state.max_steps} actions reached without completing goal."
+                state.final_output = f"Stopped: reached limit of {state.max_steps} actions."
 
         except Exception as exc:
             stop_reason = StopReason.EXECUTION_FAILED

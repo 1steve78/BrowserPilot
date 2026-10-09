@@ -301,7 +301,7 @@ async def test_max_steps_action_limit():
 
     state = await runner.run(AgentRunRequest(goal="Browse pages", max_steps=3))
 
-    assert state.status == RunStatus.COMPLETED
+    assert state.status == RunStatus.FAILED
     assert "limit of 3 actions" in (state.final_output or "")
     assert state.current_step == 3
 
@@ -497,3 +497,337 @@ async def test_cancellation_request_stop():
     assert state.status == RunStatus.STOPPED
     assert "stopped by user request" in (state.final_output or "")
     assert mock_model.get_next_action.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Focused regression tests for Hardening Member A's Step 3
+# ---------------------------------------------------------------------------
+
+
+def test_goal_keyword_without_completion_remains_unverified():
+    """Verify that a goal keyword appearing on the page does not falsely verify completion."""
+    obs = make_sample_observation(
+        url="http://localhost:8080/products",
+        title="Electronics Store - Shopping Cart (0)",
+        dom_summary="[0] <a href='/cart'> 'Cart (0)' -> selector: `#cart-link`\n[1] <h3> 'Pro Laptop $1299' -> selector: `#item-1`",
+        snippet="Browse our collection of laptops. Your cart is currently empty (0 items).",
+    )
+    assert not verify_task_completion(
+        goal="Add laptop to the cart",
+        finish_description="I added the laptop to the cart",
+        observation=obs,
+        history=[],
+    )
+
+
+def test_generic_completion_words_alone_do_not_verify():
+    """Verify that words like 'complete', 'saved', or 'success' in unrelated copy do not verify completion."""
+    obs = make_sample_observation(
+        url="http://localhost:8080/about",
+        title="Company Information",
+        dom_summary="[0] <div> 'Footer' -> selector: `#footer`",
+        snippet="View our complete product catalog. Saved items can be accessed via profile. Success stories of our happy clients.",
+    )
+    assert not verify_task_completion(
+        goal="Submit contact inquiry form",
+        finish_description="Inquiry submitted",
+        observation=obs,
+        history=[],
+    )
+
+
+def test_plausible_explicit_completion_accepted():
+    """Verify that explicit completion evidence in observation and execution history is accepted."""
+    obs = make_sample_observation(
+        url="http://localhost:8080/contact/thank-you",
+        title="Thank You - Submission Received",
+        dom_summary="[0] <h2> 'Message Sent Successfully' -> selector: `#confirm-msg`",
+        snippet="Thank you for contacting us! Your submission was confirmed and our team will respond shortly.",
+    )
+    mock_step = MagicMock()
+    mock_step.execution_result.success = True
+
+    assert verify_task_completion(
+        goal="Submit contact inquiry form",
+        finish_description="Contact form submitted and confirmed",
+        observation=obs,
+        history=[mock_step],
+    )
+
+
+def test_search_box_alone_does_not_prove_search_completed():
+    """Verify that the mere presence of a search input or 'search' word does not verify search completion."""
+    obs_unsearched = make_sample_observation(
+        url="http://localhost:8080/",
+        title="Store Home Page",
+        dom_summary="[0] <input> 'Search products...' -> selector: `#search-box`",
+        snippet="Search through hundreds of electronics. Enter your search query above.",
+    )
+    assert not verify_task_completion(
+        goal="Search for headphones",
+        finish_description="I searched for headphones",
+        observation=obs_unsearched,
+        history=[],
+    )
+
+    obs_searched = make_sample_observation(
+        url="http://localhost:8080/search?q=headphones",
+        title="Search Results for 'headphones'",
+        dom_summary="[0] <div> 'Showing results for headphones' -> selector: `#results`",
+        snippet="Showing 8 products found matching 'headphones'. Bluetooth Over-Ear Headphones $99.",
+    )
+    assert verify_task_completion(
+        goal="Search for headphones",
+        finish_description="Found 8 headphone products",
+        observation=obs_searched,
+        history=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_max_steps_exhaustion_never_returns_completed_or_success():
+    """Verify maximum-step limit exhaustion returns RunStatus.FAILED and never RunStatus.COMPLETED."""
+    mock_model = MagicMock(spec=OllamaModelClient)
+    mock_observer = MagicMock()
+    mock_executor = MagicMock()
+    mock_safety = MagicMock()
+    mock_events = MagicMock()
+    mock_events.emit = AsyncMock()
+
+    obs = make_sample_observation(url="http://localhost:8080/catalog")
+    mock_observer.observe = AsyncMock(return_value=obs)
+
+    step_action = AgentResponse(
+        thought=make_sample_thought("Browse page"),
+        action=BrowserAction(
+            action_type=ActionType.CLICK,
+            selector="#submit-btn",
+            description="Click next page",
+        ),
+    )
+    mock_model.get_next_action = AsyncMock(return_value=step_action)
+    mock_executor.initialize = AsyncMock(return_value=MagicMock())
+    mock_executor.execute = AsyncMock(
+        return_value=ExecutionResult(success=True, action_type=ActionType.CLICK, message="OK")
+    )
+    mock_safety.inspect_observation = MagicMock(return_value=[])
+    mock_safety.evaluate_action = MagicMock(return_value=SafetyCheckResult(is_safe=True))
+
+    runner = ControlledAgentRunner(
+        model_client=mock_model,
+        observer=mock_observer,
+        executor=mock_executor,
+        safety=mock_safety,
+        events=mock_events,
+        default_max_steps=2,
+    )
+
+    state = await runner.run(AgentRunRequest(goal="Exhaust all steps", max_steps=2))
+
+    assert state.status == RunStatus.FAILED
+    assert state.status != RunStatus.COMPLETED
+    assert "limit of 2 actions" in (state.final_output or "")
+    assert state.current_step == 2
+
+    run_finished_calls = [
+        call for call in mock_events.emit.call_args_list
+        if getattr(call[0][0], "value", call[0][0]) == "run_finished"
+    ]
+    assert len(run_finished_calls) == 1
+    event_payload = run_finished_calls[0][0][2]
+    assert event_payload["status"] == RunStatus.FAILED.value
+    assert event_payload["stop_reason"] == StopReason.MAX_STEPS_REACHED.value
+    assert event_payload["completion_verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_genuinely_verified_success_reports_completed_status():
+    """Verify genuinely verified task completes with RunStatus.COMPLETED and completion_verified=True."""
+    mock_model = MagicMock(spec=OllamaModelClient)
+    mock_observer = MagicMock()
+    mock_executor = MagicMock()
+    mock_safety = MagicMock()
+    mock_events = MagicMock()
+    mock_events.emit = AsyncMock()
+
+    obs_step1 = make_sample_observation(title="Checkout Form")
+    obs_step2 = make_sample_observation(
+        title="Order Confirmation",
+        snippet="Thank you for your order! Order confirmed: #98765.",
+    )
+    mock_observer.observe = AsyncMock(side_effect=[obs_step1, obs_step2])
+
+    resp1 = AgentResponse(
+        thought=make_sample_thought("Place order"),
+        action=BrowserAction(
+            action_type=ActionType.CLICK,
+            selector="#submit-btn",
+            description="Click place order",
+        ),
+    )
+    resp2 = AgentResponse(
+        thought=make_sample_thought("Order placed"),
+        action=BrowserAction(
+            action_type=ActionType.FINISH,
+            description="Order confirmed and placed",
+        ),
+    )
+    mock_model.get_next_action = AsyncMock(side_effect=[resp1, resp2])
+    mock_executor.initialize = AsyncMock(return_value=MagicMock())
+    mock_executor.execute = AsyncMock(
+        return_value=ExecutionResult(success=True, action_type=ActionType.CLICK, message="OK")
+    )
+    mock_safety.inspect_observation = MagicMock(return_value=[])
+    mock_safety.evaluate_action = MagicMock(return_value=SafetyCheckResult(is_safe=True))
+
+    runner = ControlledAgentRunner(
+        model_client=mock_model,
+        observer=mock_observer,
+        executor=mock_executor,
+        safety=mock_safety,
+        events=mock_events,
+    )
+
+    state = await runner.run(AgentRunRequest(goal="Place order", max_steps=5))
+
+    assert state.status == RunStatus.COMPLETED
+    assert "Verified" in (state.final_output or "")
+    assert len(state.history) == 1
+
+    run_finished_calls = [
+        call for call in mock_events.emit.call_args_list
+        if getattr(call[0][0], "value", call[0][0]) == "run_finished"
+    ]
+    assert len(run_finished_calls) == 1
+    event_payload = run_finished_calls[0][0][2]
+    assert event_payload["status"] == RunStatus.COMPLETED.value
+    assert event_payload["stop_reason"] == StopReason.COMPLETED.value
+    assert event_payload["completion_verified"] is True
+
+
+def test_selector_grounding_accepts_structured_interactive_elements():
+    """Verify that valid observed selectors matching structured interactive elements are accepted."""
+    obs = make_sample_observation(
+        interactive_elements=[
+            ElementDescriptor(
+                tag_name="button",
+                selector="#btn-submit",
+                id="btn-submit",
+                text="Submit",
+            ),
+            ElementDescriptor(
+                tag_name="button",
+                selector="button:nth-of-type(2)",
+                id=None,
+                text="Cancel",
+            ),
+            ElementDescriptor(
+                tag_name="input",
+                selector="[data-agent-id='agent-input-1']",
+                id="agent-input-1",
+                text="",
+            ),
+        ]
+    )
+
+    assert is_action_grounded(
+        BrowserAction(action_type=ActionType.CLICK, selector="#btn-submit", description="test"),
+        obs,
+    )
+    assert is_action_grounded(
+        BrowserAction(action_type=ActionType.CLICK, selector="button:nth-of-type(2)", description="test"),
+        obs,
+    )
+    assert is_action_grounded(
+        BrowserAction(action_type=ActionType.TYPE, selector="[data-agent-id='agent-input-1']", description="test"),
+        obs,
+    )
+    assert is_action_grounded(
+        BrowserAction(action_type=ActionType.CLICK, selector="btn-submit", description="test"),
+        obs,
+    )
+
+
+def test_selector_grounding_rejects_substring_only_matches():
+    """Verify that common selectors appearing only as substrings in dom_summary/text are strictly rejected."""
+    obs = make_sample_observation(
+        dom_summary="[0] <button> 'Submit All' -> selector: `#real-btn`\n[1] <input> 'User Input' -> selector: `#username`",
+        snippet="Please click the button to input details. Check element #e1 before leaving.",
+        interactive_elements=[
+            ElementDescriptor(
+                tag_name="button",
+                selector="#real-btn",
+                id="real-btn",
+                text="Submit All",
+            ),
+            ElementDescriptor(
+                tag_name="input",
+                selector="#username",
+                id="username",
+                text="User Input",
+            ),
+        ],
+    )
+
+    assert not is_action_grounded(
+        BrowserAction(action_type=ActionType.CLICK, selector="button", description="test"),
+        obs,
+    )
+    assert not is_action_grounded(
+        BrowserAction(action_type=ActionType.TYPE, selector="input", description="test"),
+        obs,
+    )
+    assert not is_action_grounded(
+        BrowserAction(action_type=ActionType.CLICK, selector="#e1", description="test"),
+        obs,
+    )
+    assert not is_action_grounded(
+        BrowserAction(action_type=ActionType.CLICK, selector="e1", description="test"),
+        obs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_step_counter_semantics_distinguishes_decisions_from_executed():
+    """Document that state.current_step counts decision iterations while len(history) counts executed actions."""
+    mock_model = MagicMock(spec=OllamaModelClient)
+    mock_observer = MagicMock()
+    mock_executor = MagicMock()
+    mock_safety = MagicMock()
+    mock_events = MagicMock()
+    mock_events.emit = AsyncMock()
+
+    obs = make_sample_observation()
+    mock_observer.observe = AsyncMock(return_value=obs)
+
+    # Action blocked by safety at step 1
+    action_resp = AgentResponse(
+        thought=make_sample_thought("Unsafe action"),
+        action=BrowserAction(
+            action_type=ActionType.CLICK,
+            selector="#submit-btn",
+            description="Dangerous click",
+        ),
+    )
+    mock_model.get_next_action = AsyncMock(return_value=action_resp)
+    mock_executor.initialize = AsyncMock(return_value=MagicMock())
+    mock_safety.inspect_observation = MagicMock(return_value=[])
+    mock_safety.evaluate_action = MagicMock(
+        return_value=SafetyCheckResult(is_safe=False, reason="Blocked")
+    )
+
+    runner = ControlledAgentRunner(
+        model_client=mock_model,
+        observer=mock_observer,
+        executor=mock_executor,
+        safety=mock_safety,
+        events=mock_events,
+    )
+
+    state = await runner.run(AgentRunRequest(goal="Safety test", max_steps=5))
+
+    # 1 decision step was attempted
+    assert state.current_step == 1
+    # 0 browser actions were executed
+    assert len(state.history) == 0
+    assert mock_executor.execute.call_count == 0
