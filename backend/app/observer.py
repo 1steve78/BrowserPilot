@@ -367,7 +367,7 @@ if __name__ == "__main__":
 
     async def run_observer_demo() -> None:
         mock_site_file = Path(__file__).resolve().parent.parent.parent / "mock-site" / "index.html"
-        test_url = sys.argv[1] if len(sys.argv) > 1 else f"file:///{mock_site_file.as_posix()}"
+        test_url = sys.argv[1] if len(sys.argv) > 1 else f"file:///{mock_site_file.as_posix()}#invoices"
 
         print(f"==================================================")
         print(f"Launching visible Chromium observer...")
@@ -381,6 +381,8 @@ if __name__ == "__main__":
 
             # 2. Navigate to mock website
             await observer.navigate(test_url)
+            if observer.page:
+                await observer.page.wait_for_timeout(300)
 
             # 3. Read page title, URL, and interactive elements
             obs = await observer.observe_structured()
@@ -402,6 +404,18 @@ if __name__ == "__main__":
 
             print(f"\nInvoice search detected: {has_search}")
             print(f"View buttons detected:   {has_view}")
+
+            # If opened without hash and search was not found, check invoices tab automatically
+            if not has_search and "#" not in test_url:
+                print("\nNavigating to #invoices to observe invoice elements...")
+                await observer.navigate(f"{test_url}#invoices")
+                if observer.page:
+                    await observer.page.wait_for_timeout(300)
+                obs_inv = await observer.observe_structured()
+                has_search = any("invoice-search" in (el["agent_id"] or "") for el in obs_inv["elements"])
+                has_view = any("view-invoice" in (el["agent_id"] or "") for el in obs_inv["elements"])
+                print(f"Invoice search detected on #invoices: {has_search}")
+                print(f"View buttons detected on #invoices:   {has_view}")
 
         finally:
             print("\nClosing browser cleanly...")
