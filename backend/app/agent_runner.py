@@ -46,6 +46,12 @@ from .schemas import (
     SafetyCheckResult,
     StepRecord,
 )
+from .trajectory_logger import (
+    TrajectoryLogger,
+    TrajectoryRunSummary,
+    TrajectoryStepRecord,
+)
+from .evaluation import classify_trajectory
 
 DEFAULT_MAX_ACTIONS = 10
 MAX_ALLOWED_ACTIONS = 30
@@ -294,6 +300,7 @@ class ControlledAgentRunner:
         events: Optional[EventManager] = None,
         default_max_steps: int = DEFAULT_MAX_ACTIONS,
         stuck_threshold: int = STUCK_ACTION_THRESHOLD,
+        trajectory_logger: Optional[TrajectoryLogger] = None,
     ) -> None:
         self.model_client = model_client or OllamaModelClient()
         self.observer = observer or PlaywrightObserver()
@@ -302,8 +309,47 @@ class ControlledAgentRunner:
         self.events = events or default_event_manager
         self.default_max_steps = default_max_steps
         self.stuck_threshold = stuck_threshold
+        self.trajectory_logger = trajectory_logger
         self._stop_requested = False
         self._current_state: Optional[AgentRunState] = None
+
+    def _record_trajectory_step(
+        self,
+        run_id: str,
+        task_id: Optional[str],
+        step_number: int,
+        goal: str,
+        observation: Optional[PageObservation],
+        action: Optional[BrowserAction],
+        grounding_valid: bool = True,
+        safety_check: Optional[SafetyCheckResult] = None,
+        exec_result: Optional[ExecutionResult] = None,
+        progress_verified: bool = False,
+        status: RunStatus = RunStatus.RUNNING,
+        stop_reason: Optional[StopReason] = None,
+        error: Optional[str] = None,
+        is_recovery_step: bool = False,
+    ) -> Optional[TrajectoryStepRecord]:
+        if not self.trajectory_logger:
+            return None
+        rec = TrajectoryStepRecord(
+            run_id=run_id,
+            task_id=task_id,
+            step_number=step_number,
+            goal=goal,
+            observation_before=TrajectoryLogger.sanitize_observation(observation),
+            action=action.model_dump() if action else None,
+            grounding_check=grounding_valid,
+            safety_check=safety_check.model_dump() if safety_check else None,
+            execution_result=exec_result.model_dump() if exec_result else None,
+            progress_verified=progress_verified,
+            run_status=status.value,
+            stop_reason=stop_reason.value if stop_reason else None,
+            error=error,
+            is_recovery_step=is_recovery_step,
+        )
+        self.trajectory_logger.log_step(rec)
+        return rec
 
     @property
     def current_state(self) -> Optional[AgentRunState]:
@@ -317,6 +363,7 @@ class ControlledAgentRunner:
         self,
         request: AgentRunRequest,
         page: Optional[Any] = None,
+        task_id: Optional[str] = None,
     ) -> AgentRunState:
         """Run the controlled cognitive loop until verification, limit, or failure."""
         run_id = str(uuid.uuid4())
@@ -372,6 +419,7 @@ class ControlledAgentRunner:
         consecutive_identical_count = 0
         stop_reason: Optional[StopReason] = None
         completion_verified = False
+        logged_steps: List[TrajectoryStepRecord] = []
 
         try:
             # 1. Initialize browser environment
@@ -404,6 +452,20 @@ class ControlledAgentRunner:
                     stop_reason = StopReason.OBSERVER_ERROR
                     state.status = RunStatus.FAILED
                     state.error = f"Observation capture failed at step {step_idx}: {exc}"
+                    step_rec = self._record_trajectory_step(
+                        run_id=run_id,
+                        task_id=task_id,
+                        step_number=step_idx,
+                        goal=request.goal,
+                        observation=None,
+                        action=None,
+                        grounding_valid=False,
+                        status=RunStatus.FAILED,
+                        stop_reason=StopReason.OBSERVER_ERROR,
+                        error=state.error,
+                    )
+                    if step_rec:
+                        logged_steps.append(step_rec)
                     await self.events.emit(
                         EventType.ERROR,
                         state.error,
@@ -472,6 +534,20 @@ class ControlledAgentRunner:
                     stop_reason = StopReason.MODEL_ERROR
                     state.status = RunStatus.FAILED
                     state.error = f"Model client failure at step {step_idx}: {exc}"
+                    step_rec = self._record_trajectory_step(
+                        run_id=run_id,
+                        task_id=task_id,
+                        step_number=step_idx,
+                        goal=request.goal,
+                        observation=observation,
+                        action=None,
+                        grounding_valid=False,
+                        status=RunStatus.FAILED,
+                        stop_reason=StopReason.MODEL_ERROR,
+                        error=state.error,
+                    )
+                    if step_rec:
+                        logged_steps.append(step_rec)
                     await self.events.emit(
                         EventType.ERROR,
                         state.error,
@@ -490,6 +566,20 @@ class ControlledAgentRunner:
                         f"Action selector '{proposed_action.selector}' is not grounded "
                         "in current page observation elements or DOM summary."
                     )
+                    step_rec = self._record_trajectory_step(
+                        run_id=run_id,
+                        task_id=task_id,
+                        step_number=step_idx,
+                        goal=request.goal,
+                        observation=observation,
+                        action=proposed_action,
+                        grounding_valid=False,
+                        status=RunStatus.FAILED,
+                        stop_reason=StopReason.UNGROUNDED_SELECTOR,
+                        error=state.error,
+                    )
+                    if step_rec:
+                        logged_steps.append(step_rec)
                     await self.events.emit(
                         EventType.ERROR,
                         state.error,
@@ -515,6 +605,20 @@ class ControlledAgentRunner:
                         f"Stuck loop detected: Action '{proposed_action.action_type.value}' "
                         f"repeated {consecutive_identical_count} times without meaningful page change."
                     )
+                    step_rec = self._record_trajectory_step(
+                        run_id=run_id,
+                        task_id=task_id,
+                        step_number=step_idx,
+                        goal=request.goal,
+                        observation=observation,
+                        action=proposed_action,
+                        grounding_valid=True,
+                        status=RunStatus.FAILED,
+                        stop_reason=StopReason.STUCK_REPEATED_ACTION,
+                        error=state.error,
+                    )
+                    if step_rec:
+                        logged_steps.append(step_rec)
                     await self.events.emit(
                         EventType.ERROR,
                         state.error,
@@ -529,6 +633,21 @@ class ControlledAgentRunner:
                     stop_reason = StopReason.SAFETY_BLOCKED
                     state.status = RunStatus.AWAITING_CONFIRMATION
                     state.error = f"Blocked unsafe action: {safety_check.reason}"
+                    step_rec = self._record_trajectory_step(
+                        run_id=run_id,
+                        task_id=task_id,
+                        step_number=step_idx,
+                        goal=request.goal,
+                        observation=observation,
+                        action=proposed_action,
+                        grounding_valid=True,
+                        safety_check=safety_check,
+                        status=RunStatus.AWAITING_CONFIRMATION,
+                        stop_reason=StopReason.SAFETY_BLOCKED,
+                        error=state.error,
+                    )
+                    if step_rec:
+                        logged_steps.append(step_rec)
                     await self.events.emit(
                         EventType.SAFETY_ALERT,
                         state.error,
@@ -564,6 +683,22 @@ class ControlledAgentRunner:
                             "Model claimed task completion ('finish'), but page state "
                             "does not corroborate completion."
                         )
+                    step_rec = self._record_trajectory_step(
+                        run_id=run_id,
+                        task_id=task_id,
+                        step_number=step_idx,
+                        goal=request.goal,
+                        observation=observation,
+                        action=proposed_action,
+                        grounding_valid=True,
+                        safety_check=safety_check,
+                        progress_verified=completion_verified,
+                        status=state.status,
+                        stop_reason=stop_reason,
+                        error=state.error,
+                    )
+                    if step_rec:
+                        logged_steps.append(step_rec)
                     break
 
                 # H. Controlled Failure on FAIL
@@ -571,6 +706,21 @@ class ControlledAgentRunner:
                     stop_reason = StopReason.EXECUTION_FAILED
                     state.status = RunStatus.FAILED
                     state.error = proposed_action.description
+                    step_rec = self._record_trajectory_step(
+                        run_id=run_id,
+                        task_id=task_id,
+                        step_number=step_idx,
+                        goal=request.goal,
+                        observation=observation,
+                        action=proposed_action,
+                        grounding_valid=True,
+                        safety_check=safety_check,
+                        status=RunStatus.FAILED,
+                        stop_reason=StopReason.EXECUTION_FAILED,
+                        error=state.error,
+                    )
+                    if step_rec:
+                        logged_steps.append(step_rec)
                     break
 
                 # I. Execute Action
@@ -591,6 +741,30 @@ class ControlledAgentRunner:
                     execution_result=exec_result,
                 )
                 state.history.append(step_record)
+
+                had_prior_problem = any(
+                    not s.grounding_check or (s.execution_result and not s.execution_result.get("success", True))
+                    for s in logged_steps
+                ) if logged_steps else False
+
+                step_rec = self._record_trajectory_step(
+                    run_id=run_id,
+                    task_id=task_id,
+                    step_number=step_idx,
+                    goal=request.goal,
+                    observation=observation,
+                    action=proposed_action,
+                    grounding_valid=True,
+                    safety_check=safety_check,
+                    exec_result=exec_result,
+                    progress_verified=exec_result.success,
+                    status=state.status,
+                    stop_reason=None if exec_result.success else StopReason.EXECUTION_FAILED,
+                    error=f"Execution failed: {exec_result.error}" if not exec_result.success else None,
+                    is_recovery_step=had_prior_problem and exec_result.success,
+                )
+                if step_rec:
+                    logged_steps.append(step_rec)
 
                 if not exec_result.success:
                     stop_reason = StopReason.EXECUTION_FAILED
@@ -636,5 +810,38 @@ class ControlledAgentRunner:
                 },
                 run_id=run_id,
             )
+
+            if self.trajectory_logger:
+                duration_sec = None
+                if state.start_time and state.end_time:
+                    duration_sec = (state.end_time - state.start_time).total_seconds()
+
+                has_rec_step = any(s.is_recovery_step for s in logged_steps)
+                classification = classify_trajectory(
+                    status=state.status,
+                    stop_reason=effective_reason,
+                    completion_verified=completion_verified,
+                    has_recovery_step=has_rec_step,
+                    steps=logged_steps,
+                )
+                summary = TrajectoryRunSummary(
+                    run_id=run_id,
+                    task_id=task_id,
+                    goal=request.goal,
+                    status=state.status.value,
+                    stop_reason=effective_reason,
+                    completion_verified=completion_verified,
+                    total_decisions=state.current_step,
+                    total_executed_actions=len(state.history),
+                    duration_seconds=round(duration_sec, 3) if duration_sec is not None else None,
+                    start_time=state.start_time.isoformat() if state.start_time else None,
+                    end_time=state.end_time.isoformat() if state.end_time else None,
+                    error=state.error,
+                    final_output=state.final_output,
+                    trajectory_label=classification.value,
+                    has_recovery_step=has_rec_step,
+                    steps=logged_steps,
+                )
+                self.trajectory_logger.log_run(summary)
 
         return state

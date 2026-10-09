@@ -56,3 +56,6 @@ desktop.ini
 # Logs
 *.log
 logs/
+
+# Experiment & Trajectory Data
+data/trajectories/
