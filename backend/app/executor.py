@@ -551,8 +551,25 @@ class PlaywrightExecutor:
                 candidate = (MOCK_SITE_DIR / file_part) if file_part else None
                 if candidate and candidate.exists():
                     target_url = f"file:///{(candidate).as_posix()}{sep}{hash_part}"
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=DEFAULT_ACTION_TIMEOUT_MS * 2)
+            if page.url == target_url:
+                await page.reload(wait_until="domcontentloaded", timeout=DEFAULT_ACTION_TIMEOUT_MS * 2)
+            else:
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=DEFAULT_ACTION_TIMEOUT_MS * 2)
             await page.wait_for_timeout(100)
+
+        # Clean up any lingering modal overlay to prevent stale modal traps across runs
+        try:
+            await page.evaluate("""() => {
+                if (typeof closeInvoiceModal === 'function') {
+                    closeInvoiceModal();
+                }
+                const modal = document.getElementById('invoice-modal-overlay');
+                if (modal) {
+                    modal.classList.remove('open');
+                }
+            }""")
+        except Exception:
+            pass
 
         current_url = page.url
         title = await page.title()
