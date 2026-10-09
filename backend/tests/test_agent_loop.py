@@ -686,6 +686,7 @@ async def test_genuinely_verified_success_reports_completed_status():
         executor=mock_executor,
         safety=mock_safety,
         events=mock_events,
+        auto_approve=True,
     )
 
     state = await runner.run(AgentRunRequest(goal="Place order", max_steps=5))
