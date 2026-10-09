@@ -216,3 +216,18 @@ async def test_concurrent_browser_requests_do_not_interfere():
         # All concurrent requests should succeed without race condition failures
         for resp in responses:
             assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_safety_guard_blocks_destructive_direct_action():
+    """Verify SafetyGuard intercepts destructive actions at POST /execute boundary."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # Purge / delete action
+        resp = await client.post("/execute", json={
+            "action": "click",
+            "target": "purge-all-data-button",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["success"] is False
+        assert "SafetyGuard" in data["message"]

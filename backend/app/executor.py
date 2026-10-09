@@ -547,8 +547,10 @@ class PlaywrightExecutor:
             await page.wait_for_timeout(100)
         else:
             if not urllib.parse.urlparse(target_url).scheme:
-                if (MOCK_SITE_DIR / target_url).exists():
-                    target_url = f"file:///{(MOCK_SITE_DIR / target_url).as_posix()}"
+                file_part, sep, hash_part = target_url.partition("#")
+                candidate = (MOCK_SITE_DIR / file_part) if file_part else None
+                if candidate and candidate.exists():
+                    target_url = f"file:///{(candidate).as_posix()}{sep}{hash_part}"
             await page.goto(target_url, wait_until="domcontentloaded", timeout=DEFAULT_ACTION_TIMEOUT_MS * 2)
             await page.wait_for_timeout(100)
 

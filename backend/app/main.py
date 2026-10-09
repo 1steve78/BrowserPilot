@@ -26,10 +26,12 @@ from .agent_loop import AgentLoop
 from .events import EventType, event_manager
 from .executor import MOCK_SITE_DEFAULT_URL, PlaywrightExecutor
 from .observer import PlaywrightObserver
+from .safety import safety_guard
 from .schemas import (
     ActionType,
     AgentRunRequest,
     AgentRunState,
+    BrowserAction,
     ExecuteActionRequest,
     ExecutionResult,
     ObservationResponse,
@@ -151,7 +153,42 @@ async def execute_action(request: ExecuteActionRequest):
                 error="Execution stopped",
             )
         else:
-            result = await executor.execute(request)
+            # Action-level safety guard policy check at shared execution boundary
+            act_type = request.action
+            if isinstance(act_type, str):
+                try:
+                    act_type = ActionType(act_type.lower())
+                except ValueError:
+                    act_type = ActionType.FAIL
+
+            browser_act = BrowserAction(
+                action_type=act_type,
+                selector=f'[data-agent-id="{request.target}"]' if request.target else None,
+                text=request.text,
+                url=request.url,
+                description=f"Direct action {act_type.value if hasattr(act_type, 'value') else act_type}" + (f" on {request.target}" if request.target else ""),
+            )
+            safety_check = safety_guard.evaluate_action(browser_act)
+            if not safety_check.is_safe:
+                await event_manager.emit(
+                    EventType.SAFETY_ALERT,
+                    message=f"Action blocked by SafetyGuard: {safety_check.reason}",
+                    data={
+                        "action": act_type.value if hasattr(act_type, "value") else str(act_type),
+                        "target": request.target,
+                        "reason": safety_check.reason,
+                    },
+                )
+                result = ExecutionResult(
+                    success=False,
+                    action_type=ActionType.FAIL,
+                    action=act_type.value if hasattr(act_type, "value") else str(act_type),
+                    target=request.target,
+                    message=f"Action blocked by SafetyGuard: {safety_check.reason}",
+                    error=safety_check.reason,
+                )
+            else:
+                result = await executor.execute(request)
 
         # Record event telemetry in event manager
         await event_manager.emit(
