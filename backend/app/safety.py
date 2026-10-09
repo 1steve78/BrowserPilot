@@ -98,18 +98,17 @@ class SafetyGuard:
         # 1. Non-destructive actions are generally safe
         if action.action_type in (ActionType.NAVIGATE, ActionType.WAIT, ActionType.SCROLL, ActionType.EXTRACT):
             # Check target URL for restricted protocols
-            if action.url and (
-                action.url.startswith("file://")
-                or action.url.startswith("javascript:")
-                or action.url.startswith("data:")
-            ):
-                return SafetyCheckResult(
-                    is_safe=False,
-                    risk_level=RiskLevel.HIGH,
-                    reason=f"Restricted URL scheme detected in navigation target: {action.url}",
-                    flagged_pattern=action.url,
-                    requires_human_confirmation=True,
-                )
+            if action.url:
+                clean_url = action.url.lower().replace("\\", "/")
+                is_local_mock = "mock-site" in clean_url or "localhost" in clean_url or "127.0.0.1" in clean_url
+                if (action.url.startswith("file://") and not is_local_mock) or action.url.startswith("javascript:") or action.url.startswith("data:"):
+                    return SafetyCheckResult(
+                        is_safe=False,
+                        risk_level=RiskLevel.HIGH,
+                        reason=f"Restricted URL scheme detected in navigation target: {action.url}",
+                        flagged_pattern=action.url,
+                        requires_human_confirmation=True,
+                    )
             return SafetyCheckResult(is_safe=True, risk_level=RiskLevel.LOW)
 
         # 2. Check for destructive action keywords in selector, text, or target description

@@ -346,6 +346,118 @@ textarea:focus, input[type="text"]:focus, .form-select:focus {
   background-color: var(--danger-bg);
 }
 
+/* Execution Mode Switcher Tabs */
+.mode-selector-tabs {
+  display: flex;
+  gap: 0.5rem;
+  background-color: var(--bg-input);
+  padding: 0.35rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  margin-bottom: 1rem;
+}
+
+.mode-tab {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.5rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: center;
+}
+
+.mode-tab:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.mode-tab.active {
+  background-color: var(--primary);
+  color: #ffffff;
+  box-shadow: 0 2px 8px var(--primary-glow);
+}
+
+/* AI Thought & Reasoning Stream Panel */
+.ai-thought-panel {
+  margin-top: 1rem;
+  padding: 0.85rem;
+  background: rgba(139, 92, 246, 0.08);
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  border-radius: var(--radius-sm);
+}
+
+.thought-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.thought-badge {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #c4b5fd;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.thought-model-tag {
+  font-size: 0.7rem;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  background: rgba(0, 0, 0, 0.3);
+  padding: 0.15rem 0.4rem;
+  border-radius: 3px;
+}
+
+.thought-item {
+  margin-bottom: 0.35rem;
+}
+
+.thought-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+}
+
+.thought-text {
+  font-size: 0.82rem;
+  color: var(--text-primary);
+  margin: 0.2rem 0 0.4rem 0;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+/* Safety Alert Styling in Feed */
+.feed-item-safety {
+  border-left: 3px solid #ef4444 !important;
+  background-color: rgba(239, 68, 68, 0.1) !important;
+}
+
+.badge-act-safety {
+  background-color: rgba(239, 68, 68, 0.25);
+  color: #fca5a5;
+  border: 1px solid #ef4444;
+}
+
+/* Informational & Lifecycle Feed Items */
+.feed-item-info {
+  border-left: 3px solid #8b5cf6 !important;
+  background-color: rgba(139, 92, 246, 0.06) !important;
+}
+
+.badge-act-info {
+  background-color: rgba(139, 92, 246, 0.2);
+  color: #c4b5fd;
+  border: 1px solid rgba(139, 92, 246, 0.4);
+}
+
 /* Buttons */
 .action-btn-group {
   display: flex;

@@ -15,23 +15,31 @@ const WS_URL = API_BASE.replace(/^http/, 'ws') + '/ws/events';
 // Internal State
 let isBackendConnected = false;
 let currentExecutionState = 'IDLE'; // IDLE | RUNNING | COMPLETED | FAILED | STOPPED
+let currentExecutionMode = 'workflow'; // workflow | autonomous | manual
 let activePreset = 'full-workflow';
 let abortRequested = false;
 let processedEventIds = new Set();
 let socket = null;
 let healthPollTimer = null;
 let eventsPollTimer = null;
+let agentStatePollTimer = null;
 
 // DOM Elements Cache
 const elBackendStatusDot = document.getElementById('backend-status-dot');
 const elBackendStatusText = document.getElementById('backend-status-text');
 const elAgentStatusBadge = document.getElementById('agent-status-badge');
 const elAgentStatusText = document.getElementById('agent-status-text');
+const elExecutionModeBadge = document.getElementById('execution-mode-badge');
 const elGoalInput = document.getElementById('goal-input');
+const elPresetsContainer = document.getElementById('presets-container');
+const elAiThoughtPanel = document.getElementById('ai-thought-panel');
+const elThoughtReflection = document.getElementById('thought-reflection');
+const elThoughtAction = document.getElementById('thought-action');
 const elBtnRun = document.getElementById('btn-run');
 const elBtnRunText = document.getElementById('btn-run-text');
 const elBtnStop = document.getElementById('btn-stop');
 const elBtnResume = document.getElementById('btn-resume');
+const elBtnResumeText = document.getElementById('btn-resume-text');
 const elBrowserTitle = document.getElementById('browser-title');
 const elBrowserUrl = document.getElementById('browser-url');
 const elActiveTargetBadge = document.getElementById('active-target-badge');
@@ -43,6 +51,11 @@ const elEventCountBadge = document.getElementById('event-count-badge');
 const elAutoscrollCheckbox = document.getElementById('autoscroll-checkbox');
 const elActivityFeedList = document.getElementById('activity-feed-list');
 const elFeedEmptyState = document.getElementById('feed-empty-state');
+
+// Mode Tab Elements
+const tabModeWorkflow = document.getElementById('tab-mode-workflow');
+const tabModeAutonomous = document.getElementById('tab-mode-autonomous');
+const tabModeManual = document.getElementById('tab-mode-manual');
 
 // Custom Single Action Drawer Elements
 const elCustomType = document.getElementById('custom-action-type');
@@ -149,8 +162,34 @@ function setActiveTargetHighlight(targetId) {
 }
 
 // ============================================================================
-// 3. Execution Lifecycle Status Feedback
+// 3. Execution Modes & Lifecycle Status Feedback
 // ============================================================================
+
+function setExecutionMode(mode) {
+  currentExecutionMode = mode;
+  [tabModeWorkflow, tabModeAutonomous, tabModeManual].forEach((tab) => {
+    if (tab) tab.classList.remove('active');
+  });
+
+  if (mode === 'workflow') {
+    if (tabModeWorkflow) tabModeWorkflow.classList.add('active');
+    if (elExecutionModeBadge) elExecutionModeBadge.textContent = 'Demo Presets';
+    if (elPresetsContainer) elPresetsContainer.style.display = 'block';
+    if (elAiThoughtPanel) elAiThoughtPanel.style.display = 'none';
+    if (elBtnRunText) elBtnRunText.textContent = 'Run Task';
+  } else if (mode === 'autonomous') {
+    if (tabModeAutonomous) tabModeAutonomous.classList.add('active');
+    if (elExecutionModeBadge) elExecutionModeBadge.textContent = 'Autonomous AI Agent';
+    if (elPresetsContainer) elPresetsContainer.style.display = 'block';
+    if (elAiThoughtPanel) elAiThoughtPanel.style.display = 'block';
+    if (elBtnRunText) elBtnRunText.textContent = 'Run Autonomous Agent';
+  } else if (mode === 'manual') {
+    if (tabModeManual) tabModeManual.classList.add('active');
+    if (elExecutionModeBadge) elExecutionModeBadge.textContent = 'Manual Custom Action';
+    if (elAiThoughtPanel) elAiThoughtPanel.style.display = 'none';
+    if (elBtnRunText) elBtnRunText.textContent = 'Execute Custom Action';
+  }
+}
 
 function setExecutionState(state, details = '') {
   currentExecutionState = state;
@@ -168,19 +207,67 @@ function setExecutionState(state, details = '') {
     elBtnRun.disabled = false;
     elBtnStop.disabled = true;
     if (elBtnResume) elBtnResume.style.display = 'inline-flex';
-    if (elBtnRunText) elBtnRunText.textContent = 'Run Task';
+    if (elBtnRunText) elBtnRunText.textContent = currentExecutionMode === 'autonomous' ? 'Run Autonomous Agent' : 'Run Task';
   } else {
     // IDLE, COMPLETED, FAILED
     elBtnRun.disabled = false;
     elBtnStop.disabled = false;
     if (elBtnResume) elBtnResume.style.display = 'none';
-    if (elBtnRunText) elBtnRunText.textContent = 'Run Task';
+    if (elBtnRunText) elBtnRunText.textContent = currentExecutionMode === 'autonomous' ? 'Run Autonomous Agent' : 'Run Task';
   }
 }
 
 // ============================================================================
-// 4. Activity Feed & Event Telemetry (GET /events & WebSocket)
+// 4. Activity Feed & Unified Event Telemetry
 // ============================================================================
+
+function normalizeEvent(raw) {
+  const type = (raw.type || '').toLowerCase();
+  const data = raw.data || {};
+  const isLifecycle = ['status_change', 'run_started', 'run_finished', 'agent_thinking', 'observation'].includes(type);
+  const isSafetyAlert = type === 'safety_alert';
+
+  // Determine true action name
+  const action = raw.action || data.action || (isLifecycle ? type.replace('_', ' ') : type) || 'ACTION';
+
+  // Target or selector
+  const target = raw.target || data.target || data.selector || null;
+
+  // Evaluate success status across Member A and Member B payload contracts
+  let isSuccess = false;
+  if (isLifecycle) {
+    isSuccess = true;
+  } else if (isSafetyAlert) {
+    isSuccess = false;
+  } else if (typeof raw.success === 'boolean') {
+    isSuccess = raw.success;
+  } else if (typeof data.success === 'boolean') {
+    isSuccess = data.success;
+  } else if (data.result && typeof data.result.success === 'boolean') {
+    isSuccess = data.result.success;
+  } else if (raw.status === 'success' || data.status === 'success') {
+    isSuccess = true;
+  } else {
+    isSuccess = false;
+  }
+
+  // Error message
+  const errorMsg = raw.error || data.error || (data.result && data.result.error) || null;
+
+  return {
+    event_id: raw.event_id || `${raw.timestamp || Date.now()}_${action}_${target || 'none'}`,
+    timestamp: raw.timestamp || new Date().toISOString(),
+    type: type,
+    action: action,
+    target: target,
+    isSuccess: isSuccess,
+    isLifecycle: isLifecycle,
+    isSafetyAlert: isSafetyAlert,
+    message: raw.message || data.message || '',
+    error: errorMsg,
+    thought: data.thought,
+  };
+}
 
 async function fetchRecentEvents() {
   if (!isBackendConnected) return;
@@ -198,10 +285,10 @@ async function fetchRecentEvents() {
   }
 }
 
-function ingestEvent(ev) {
-  const evKey = ev.event_id || `${ev.timestamp}_${ev.action}_${ev.target}`;
-  if (processedEventIds.has(evKey)) return;
-  processedEventIds.add(evKey);
+function ingestEvent(rawEv) {
+  const ev = normalizeEvent(rawEv);
+  if (processedEventIds.has(ev.event_id)) return;
+  processedEventIds.add(ev.event_id);
 
   renderEventItem(ev);
 }
@@ -211,11 +298,11 @@ function renderEventItem(ev) {
     elFeedEmptyState.style.display = 'none';
   }
 
-  const isSuccess = ev.success === true || ev.status === 'success';
-  const actionName = (ev.action || ev.type || 'ACTION').toUpperCase();
-  const targetName = ev.target || (ev.data && ev.data.target) || null;
+  const isSuccess = ev.isSuccess;
+  const actionName = ev.action.toUpperCase();
+  const targetName = ev.target;
   const message = ev.message || (isSuccess ? 'Action completed successfully' : 'Action failed');
-  const errorMsg = ev.error || (ev.data && ev.data.error) || null;
+  const errorMsg = ev.error;
   const timestamp = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
 
   if (targetName) {
@@ -223,7 +310,26 @@ function renderEventItem(ev) {
   }
 
   const item = document.createElement('div');
-  item.className = `feed-item ${isSuccess ? 'feed-item-success' : 'feed-item-error'}`;
+  if (ev.isSafetyAlert) {
+    item.className = 'feed-item feed-item-safety feed-item-error';
+  } else if (ev.isLifecycle) {
+    item.className = 'feed-item feed-item-info';
+  } else {
+    item.className = `feed-item ${isSuccess ? 'feed-item-success' : 'feed-item-error'}`;
+  }
+
+  let badgeClass = 'badge-act-failure';
+  let badgePrefix = '✗ ';
+  if (ev.isSafetyAlert) {
+    badgeClass = 'badge-act-safety';
+    badgePrefix = '🛡️ ';
+  } else if (ev.isLifecycle) {
+    badgeClass = 'badge-act-info';
+    badgePrefix = 'ℹ️ ';
+  } else if (isSuccess) {
+    badgeClass = 'badge-act-success';
+    badgePrefix = '✓ ';
+  }
 
   let targetHtml = targetName ? `<span class="feed-target-pill">🎯 ${escapeHtml(targetName)}</span>` : '';
   let errorHtml = (!isSuccess && errorMsg) ? `<div class="feed-error-box">⚠️ Error: ${escapeHtml(errorMsg)}</div>` : '';
@@ -231,8 +337,8 @@ function renderEventItem(ev) {
   item.innerHTML = `
     <div class="feed-item-header">
       <div class="feed-header-left">
-        <span class="feed-action-badge ${isSuccess ? 'badge-act-success' : 'badge-act-failure'}">
-          ${isSuccess ? '✓ ' : '✗ '}${escapeHtml(actionName)}
+        <span class="feed-action-badge ${badgeClass}">
+          ${badgePrefix}${escapeHtml(actionName)}
         </span>
         ${targetHtml}
       </div>
@@ -284,19 +390,19 @@ function connectWebSocket() {
     socket.onmessage = (event) => {
       try {
         const payload = JSON.parse(event.data);
-        if (payload.event_id || payload.type) {
-          ingestEvent({
-            event_id: payload.event_id,
-            timestamp: payload.timestamp,
-            action: payload.data?.action || payload.type,
-            target: payload.data?.target,
-            status: payload.data?.status || (payload.data?.success ? 'success' : 'failure'),
-            success: payload.data?.success ?? true,
-            message: payload.message,
-            error: payload.data?.error,
-            data: payload.data,
-          });
+        if (payload.type === 'status_change') {
+          const status = payload.data?.status || 'RUNNING';
+          setExecutionState(status.toUpperCase());
+        } else if (payload.type === 'run_finished') {
+          const status = payload.data?.status || 'COMPLETED';
+          setExecutionState(status.toUpperCase());
+        } else if (payload.type === 'action_proposed') {
+          if (payload.data?.thought) {
+            if (elThoughtReflection) elThoughtReflection.textContent = payload.data.thought.reflection || '-';
+            if (elThoughtAction) elThoughtAction.textContent = `${payload.data.thought.plan?.join(' -> ') || payload.data.thought.reasoning || '-'}`;
+          }
         }
+        ingestEvent(payload);
       } catch (e) {
         console.warn('Failed to parse WS payload:', e);
       }
@@ -368,6 +474,7 @@ const PRESETS = {
 };
 
 function selectPreset(presetKey) {
+  setExecutionMode('workflow');
   activePreset = presetKey;
   const config = PRESETS[presetKey];
   if (!config) return;
@@ -420,8 +527,49 @@ async function executeActionRequest(payload) {
 }
 
 /**
+ * Dispatch autonomous AI agent run via POST /api/agent/start
+ */
+async function runAutonomousAgentTask() {
+  const goal = (elGoalInput ? elGoalInput.value : '').trim();
+  if (!goal) {
+    alert('Please enter a goal objective for the autonomous agent.');
+    return;
+  }
+
+  abortRequested = false;
+  setExecutionState('RUNNING');
+  if (elAiThoughtPanel) elAiThoughtPanel.style.display = 'block';
+
+  try {
+    const startUrl = (elBrowserUrl && elBrowserUrl.textContent !== 'about:blank')
+      ? elBrowserUrl.textContent
+      : undefined;
+
+    const res = await fetch(`${API_BASE}/api/agent/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        goal: goal,
+        start_url: startUrl,
+        max_steps: 15,
+      }),
+    });
+
+    const data = await res.json();
+    if (data.error) {
+      setExecutionState('FAILED', data.error);
+    } else {
+      console.log('Autonomous agent run initiated:', data);
+    }
+  } catch (err) {
+    setExecutionState('FAILED', err.message);
+    console.error('Failed to initiate autonomous agent task:', err);
+  }
+}
+
+/**
  * Main Run Task Handler
- * Executes real actions sequentially against the FastAPI backend
+ * Dispatches autonomous AI agent, demo preset workflows, or manual action based on mode
  */
 async function runCurrentTask() {
   if (!isBackendConnected) {
@@ -432,6 +580,19 @@ async function runCurrentTask() {
     }
   }
 
+  // 1. Autonomous Agent Mode
+  if (currentExecutionMode === 'autonomous') {
+    await runAutonomousAgentTask();
+    return;
+  }
+
+  // 2. Manual Custom Action Mode
+  if (currentExecutionMode === 'manual') {
+    await executeCustomSingleAction();
+    return;
+  }
+
+  // 3. Demo Workflow Presets Mode (Real browser execution through POST /execute)
   abortRequested = false;
   setExecutionState('RUNNING');
   console.log('Task run initiated for preset:', activePreset);
@@ -490,27 +651,30 @@ async function runCurrentTask() {
 
 /**
  * Stop Execution Handler
- * Commands POST /stop to set the backend stop flag and halt actions
+ * Halts both direct browser executions (/stop) and active autonomous agent runs (/api/agent/stop)
  */
 async function stopCurrentTask() {
   abortRequested = true;
-  setExecutionState('STOPPED');
 
   try {
-    const res = await fetch(`${API_BASE}/stop`, { method: 'POST' });
-    if (res.ok) {
-      console.log('Stop signal confirmed by backend.');
-    }
+    await Promise.allSettled([
+      fetch(`${API_BASE}/stop`, { method: 'POST' }),
+      fetch(`${API_BASE}/api/agent/stop`, { method: 'POST' }),
+    ]);
+
+    setExecutionState('STOPPED');
+    console.log('Stop signal confirmed by backend.');
     await fetchRecentEvents();
     await refreshObservation();
   } catch (err) {
+    setExecutionState('STOPPED');
     console.error('Failed to dispatch stop request:', err);
   }
 }
 
 /**
  * Resume Execution Handler
- * Commands POST /resume to reset backend stop flag
+ * Commands POST /resume to reset backend stop flag and enable action executions
  */
 async function resumeAgent() {
   abortRequested = false;
@@ -572,6 +736,30 @@ async function executeCustomSingleAction() {
   }
 }
 
+/**
+ * Periodic sync of autonomous agent state snapshot from /api/agent/state
+ */
+async function syncBackendAgentState() {
+  if (!isBackendConnected) return;
+
+  try {
+    const res = await fetch(`${API_BASE}/api/agent/state`);
+    if (!res.ok) return;
+
+    const data = await res.json();
+    if (data && data.status) {
+      const backendStatus = String(data.status).toUpperCase();
+      if (backendStatus === 'RUNNING' && currentExecutionState !== 'RUNNING') {
+        setExecutionState('RUNNING');
+      } else if (backendStatus === 'STOPPED' && currentExecutionState !== 'STOPPED') {
+        setExecutionState('STOPPED');
+      }
+    }
+  } catch (err) {
+    // Suppress polling error
+  }
+}
+
 // ============================================================================
 // 6. Utility Functions
 // ============================================================================
@@ -611,11 +799,27 @@ async function initDashboard() {
     }
   }, 1200);
 
+  agentStatePollTimer = setInterval(async () => {
+    if (isBackendConnected) {
+      await syncBackendAgentState();
+    }
+  }, 2000);
+
   // 3. Connect WebSocket for live streaming
   connectWebSocket();
 
-  // 4. Default preset selection
+  // 4. Default mode and preset
+  setExecutionMode('workflow');
   selectPreset('full-workflow');
+
+  // 5. Goal input listener switches to autonomous mode when custom text is typed
+  if (elGoalInput) {
+    elGoalInput.addEventListener('input', () => {
+      if (currentExecutionMode !== 'autonomous') {
+        setExecutionMode('autonomous');
+      }
+    });
+  }
 }
 
 window.addEventListener('DOMContentLoaded', initDashboard);

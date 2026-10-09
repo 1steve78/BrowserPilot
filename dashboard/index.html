@@ -41,7 +41,23 @@
         <section class="card" id="panel-task-controls">
           <div class="card-header">
             <h2 class="card-title">Task & Action Controller</h2>
-            <span class="card-badge" id="execution-mode-badge">Direct Execution</span>
+            <span class="card-badge" id="execution-mode-badge">Demo Presets</span>
+          </div>
+
+          <!-- Execution Mode Selector -->
+          <div class="form-group">
+            <label>Execution Mode</label>
+            <div class="mode-selector-tabs">
+              <button type="button" class="mode-tab active" id="tab-mode-workflow" onclick="setExecutionMode('workflow')">
+                ⚡ Demo Presets
+              </button>
+              <button type="button" class="mode-tab" id="tab-mode-autonomous" onclick="setExecutionMode('autonomous')">
+                🤖 Autonomous Agent (AI)
+              </button>
+              <button type="button" class="mode-tab" id="tab-mode-manual" onclick="setExecutionMode('manual')">
+                🛠️ Custom Action
+              </button>
+            </div>
           </div>
 
           <!-- Natural Language Goal Input -->
@@ -50,8 +66,8 @@
             <textarea id="goal-input" rows="2" placeholder="e.g. Open invoices, search for INV-1001, and inspect details.">Verify invoice 1001 details on mock site</textarea>
           </div>
 
-          <!-- Quick Workflow Presets -->
-          <div class="form-group">
+          <!-- Quick Workflow Presets Container -->
+          <div class="form-group" id="presets-container">
             <label>Quick Action Presets</label>
             <div class="presets-toolbar">
               <button type="button" class="preset-btn active" id="preset-workflow" onclick="selectPreset('full-workflow')">
@@ -75,6 +91,22 @@
             </div>
           </div>
 
+          <!-- Autonomous AI Reasoning Monitor (Active during Autonomous runs) -->
+          <div class="ai-thought-panel" id="ai-thought-panel" style="display: none;">
+            <div class="thought-header">
+              <span class="thought-badge">🧠 Autonomous Model Stream</span>
+              <span class="thought-model-tag" id="thought-model-tag">Ollama LLM</span>
+            </div>
+            <div class="thought-item">
+              <span class="thought-label">Reflection:</span>
+              <p class="thought-text" id="thought-reflection">-</p>
+            </div>
+            <div class="thought-item">
+              <span class="thought-label">Reasoning & Action:</span>
+              <p class="thought-text" id="thought-action">-</p>
+            </div>
+          </div>
+
           <!-- Action Control Buttons -->
           <div class="action-btn-group">
             <button type="button" class="btn btn-primary" id="btn-run" onclick="runCurrentTask()">
@@ -87,7 +119,7 @@
             </button>
             <button type="button" class="btn btn-secondary" id="btn-resume" onclick="resumeAgent()" style="display: none;">
               <span class="btn-icon">↺</span>
-              <span>Resume</span>
+              <span id="btn-resume-text">Enable Actions / Resume</span>
             </button>
           </div>
 
