@@ -25,9 +25,14 @@ from backend.app.approval import (
     SafetyDecision,
     SafetyDecisionType,
     classify_action_safety,
+    resolve_target_element,
 )
-from backend.app.events import EventManager
-from backend.app.model_client import OllamaModelClient
+from backend.app.events import EventType, EventManager
+from backend.app.model_client import (
+    DeterministicDemoModelClient,
+    ModelClientProtocol,
+    OllamaModelClient,
+)
 from backend.app.safety import SafetyGuard
 from backend.app.schemas import (
     ActionType,
@@ -934,3 +939,403 @@ def test_restricted_schemes_in_arbitrary_actions_blocked():
     decision = classify_action_safety(type_js, obs)
     assert decision.decision_type == SafetyDecisionType.BLOCK
     assert decision.is_safe is False
+
+
+# ============================================================================
+# 4. CodeRabbit PR #7 Hardened Safety & Architectural Regression Suite
+# ============================================================================
+
+def test_target_labelled_publish_cannot_evade_approval_via_search_description():
+    """Verify that a target element labelled 'Publish' requires human approval even if
+    the model framed its action description or thought as a routine 'search'.
+    """
+    obs = PageObservation(
+        url="http://localhost:8080/editor",
+        title="Content Editor",
+        dom_summary="button#btn-pub 'Publish Post'",
+        interactive_elements=[
+            ElementDescriptor(tag_name="button", selector="#btn-pub", text="Publish Post", role="button"),
+        ],
+    )
+    # Model evades in description by describing this as 'search'
+    evasive_action = BrowserAction(
+        action_type=ActionType.CLICK,
+        selector="#btn-pub",
+        description="Search for posts matching query",
+    )
+    decision = classify_action_safety(evasive_action, obs)
+    assert decision.decision_type == SafetyDecisionType.REQUIRE_APPROVAL
+    assert decision.requires_human_confirmation is True
+    assert decision.flagged_pattern == "publish"
+
+
+def test_quote_normalized_selectors_resolve_and_retain_classification():
+    """Verify that quote normalization (' vs \") allows target resolution and preserves
+    safety classification across single/double quote discrepancies.
+    """
+    obs = PageObservation(
+        url="http://localhost:8080/store",
+        title="Store",
+        dom_summary='button[data-agent-id="btn-checkout"]',
+        interactive_elements=[
+            ElementDescriptor(
+                tag_name="button",
+                selector='button[data-agent-id="btn-checkout"]',
+                id="btn-checkout",
+                text="Proceed to Checkout",
+                role="button",
+            ),
+        ],
+    )
+    # Action uses single quotes in selector
+    single_quote_action = BrowserAction(
+        action_type=ActionType.CLICK,
+        selector="button[data-agent-id='btn-checkout']",
+        description="Proceed to payment",
+    )
+    target = resolve_target_element(single_quote_action, obs)
+    assert target is not None
+    assert target.id == "btn-checkout"
+
+    decision = classify_action_safety(single_quote_action, obs)
+    assert decision.decision_type == SafetyDecisionType.REQUIRE_APPROVAL
+    assert decision.requires_human_confirmation is True
+
+
+def test_unconditional_destructive_denial_cannot_become_human_approval():
+    """Verify that hard-prohibited destructive patterns (e.g. purge, drop database)
+    strictly return BLOCK, never downgraded to human approval regardless of configuration.
+    """
+    obs = make_test_observation()
+    purge_action = BrowserAction(
+        action_type=ActionType.CLICK,
+        selector="#btn-search",
+        description="purge all database items",
+    )
+    decision = classify_action_safety(purge_action, obs)
+    assert decision.decision_type == SafetyDecisionType.BLOCK
+    assert decision.is_safe is False
+    assert decision.requires_human_confirmation is False
+
+
+def test_tampering_action_key_or_parameters_invalidates_approval():
+    """Verify that altering execution-relevant action parameters (e.g., keyboard key,
+    selector, wait_seconds) between approval creation and execution invalidates approval.
+    """
+    manager = ApprovalManager()
+    original_action = BrowserAction(
+        action_type=ActionType.PRESS_KEY,
+        key="Enter",
+        description="Submit form via keypress",
+    )
+    req = manager.create_request(run_id="run-tamper-key", step_number=1, action=original_action, reason="Keypress")
+    manager.resolve_request(req.approval_id, approved=True)
+
+    # Valid execution with original key
+    assert manager.is_valid_for_execution(req.approval_id, original_action, is_run_active=True) is True
+
+    # Tampered key parameter -> must be rejected
+    tampered_key_action = BrowserAction(
+        action_type=ActionType.PRESS_KEY,
+        key="Escape",
+        description="Submit form via keypress",
+    )
+    assert manager.is_valid_for_execution(req.approval_id, tampered_key_action, is_run_active=True) is False
+
+
+def test_mutating_get_request_copy_does_not_mutate_internal_state():
+    """Verify that mutating the ApprovalRequest object returned by get_request() or
+    list_pending_requests() does not tamper with the internal state in ApprovalManager.
+    """
+    manager = ApprovalManager()
+    action = BrowserAction(action_type=ActionType.CLICK, selector="#btn-pay", description="Pay invoice")
+    req = manager.create_request(run_id="run-tamper-obj", step_number=1, action=action, reason="Pay")
+
+    # Retrieve snapshot and tamper with its status and action selector
+    retrieved = manager.get_request(req.approval_id)
+    assert retrieved is not None
+    assert retrieved.status == ApprovalStatus.PENDING
+
+    retrieved.status = ApprovalStatus.APPROVED
+    retrieved.action.selector = "#tampered-selector"
+
+    # Internal state in manager must remain intact and pending
+    fresh_check = manager.get_request(req.approval_id)
+    assert fresh_check is not None
+    assert fresh_check.status == ApprovalStatus.PENDING
+    assert fresh_check.action.selector == "#btn-pay"
+
+    # Tampered status must not authorize execution
+    assert manager.is_valid_for_execution(req.approval_id, action, is_run_active=True) is False
+
+
+@pytest.mark.asyncio
+async def test_page_drift_during_approval_wait_fails_closed():
+    """Verify that if the page context drifts (e.g. navigation or element mutation)
+    during human approval wait, execution fails closed with SAFETY_BLOCKED and never executes.
+    """
+    mock_model = MagicMock(spec=OllamaModelClient)
+    mock_observer = MagicMock()
+    mock_executor = MagicMock()
+    mock_events = MagicMock()
+    mock_events.emit = AsyncMock()
+
+    obs_initial = PageObservation(
+        url="http://localhost:8080/checkout",
+        title="Checkout Page",
+        dom_summary="button#btn-pay 'Pay $50.00'",
+        interactive_elements=[
+            ElementDescriptor(tag_name="button", selector="#btn-pay", text="Pay $50.00", role="button"),
+        ],
+    )
+    # Mutated page state returned after approval wait (e.g. price mutated to $5,000)
+    obs_mutated = PageObservation(
+        url="http://localhost:8080/checkout",
+        title="Checkout Page",
+        dom_summary="button#btn-pay 'Pay $5,000.00'",
+        interactive_elements=[
+            ElementDescriptor(tag_name="button", selector="#btn-pay", text="Pay $5,000.00", role="button"),
+        ],
+    )
+    mock_observer.observe = AsyncMock(side_effect=[obs_initial, obs_mutated])
+    mock_executor.initialize = AsyncMock(return_value=MagicMock())
+
+    consequential_action = BrowserAction(
+        action_type=ActionType.CLICK,
+        selector="#btn-pay",
+        description="Pay $50.00",
+    )
+    mock_model.get_next_action = AsyncMock(
+        return_value=AgentResponse(thought=make_test_thought(), action=consequential_action)
+    )
+
+    approval_manager = ApprovalManager()
+    runner = ControlledAgentRunner(
+        model_client=mock_model,
+        observer=mock_observer,
+        executor=mock_executor,
+        approval_manager=approval_manager,
+    )
+
+    async def approve_after_short_wait():
+        await asyncio.sleep(0.05)
+        pending = approval_manager.list_pending_requests()
+        if pending:
+            approval_manager.resolve_request(pending[0].approval_id, approved=True, reason="Approved by human")
+
+    asyncio.create_task(approve_after_short_wait())
+    state = await runner.run(AgentRunRequest(goal="Pay bill", max_steps=5))
+
+    # Must fail closed with SAFETY_BLOCKED due to element text mutation drift
+    assert state.status == RunStatus.FAILED
+    assert "drifted during approval wait" in (state.error or "")
+    assert mock_executor.execute.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_atomic_validate_and_consume_prevents_reuse():
+    """Verify that validate_and_consume is atomic and transitions approval to EXPIRED,
+    strictly preventing replay or double-execution.
+    """
+    manager = ApprovalManager()
+    action = BrowserAction(action_type=ActionType.CLICK, selector="#btn-pay", description="Pay invoice")
+    req = manager.create_request(run_id="run-atomic-1", step_number=1, action=action, reason="Authorize")
+    manager.resolve_request(req.approval_id, approved=True)
+
+    # First consumption succeeds
+    first_res = await manager.validate_and_consume(
+        approval_id=req.approval_id,
+        expected_run_id="run-atomic-1",
+        expected_action=action,
+        is_run_active=True,
+    )
+    assert first_res is True
+
+    # Replay attempt fails
+    second_res = await manager.validate_and_consume(
+        approval_id=req.approval_id,
+        expected_run_id="run-atomic-1",
+        expected_action=action,
+        is_run_active=True,
+    )
+    assert second_res is False
+
+
+@pytest.mark.asyncio
+async def test_approval_bound_to_run_id_rejects_different_run():
+    """Verify that an approval issued for run-A cannot be consumed or executed by run-B."""
+    manager = ApprovalManager()
+    action = BrowserAction(action_type=ActionType.CLICK, selector="#btn-pay", description="Pay invoice")
+    req = manager.create_request(run_id="run-A", step_number=1, action=action, reason="Authorize")
+    manager.resolve_request(req.approval_id, approved=True)
+
+    # Attempt to consume from run-B must fail
+    res = await manager.validate_and_consume(
+        approval_id=req.approval_id,
+        expected_run_id="run-B",
+        expected_action=action,
+        is_run_active=True,
+    )
+    assert res is False
+    assert manager.is_valid_for_execution(req.approval_id, action, is_run_active=True, expected_run_id="run-B") is False
+
+
+def test_expired_rejected_timed_out_cancelled_approvals_cannot_authorize():
+    """Verify that terminal approval statuses (EXPIRED, REJECTED, TIMED_OUT, CANCELLED)
+    all fail authorization checks.
+    """
+    manager = ApprovalManager()
+    action = BrowserAction(action_type=ActionType.CLICK, selector="#btn-pay", description="Pay invoice")
+
+    for status in (ApprovalStatus.EXPIRED, ApprovalStatus.REJECTED, ApprovalStatus.TIMED_OUT, ApprovalStatus.CANCELLED):
+        req = manager.create_request(run_id=f"run-{status.value}", step_number=1, action=action, reason="Test")
+        # Mutate internal request directly for test fixture setup
+        manager._requests[req.approval_id].status = status
+
+        assert manager.is_valid_for_execution(req.approval_id, action, is_run_active=True) is False
+
+
+@pytest.mark.asyncio
+async def test_runner_status_and_events_represent_awaiting_confirmation_and_resumption():
+    """Verify runner transitions to AWAITING_CONFIRMATION when waiting for human decision
+    and emits appropriate STATUS_CHANGE events before and upon resumption.
+    """
+    mock_model = MagicMock(spec=OllamaModelClient)
+    mock_observer = MagicMock()
+    mock_executor = MagicMock()
+    mock_events = MagicMock()
+    mock_events.emit = AsyncMock()
+
+    obs = make_test_observation()
+    mock_observer.observe = AsyncMock(return_value=obs)
+    mock_executor.initialize = AsyncMock(return_value=MagicMock())
+    mock_executor.execute = AsyncMock(
+        return_value=ExecutionResult(success=True, action_type=ActionType.CLICK, message="Payment done")
+    )
+
+    action = BrowserAction(action_type=ActionType.CLICK, selector="#btn-pay", description="Pay invoice")
+    finish_action = BrowserAction(action_type=ActionType.FINISH, description="Done")
+    mock_model.get_next_action = AsyncMock(
+        side_effect=[
+            AgentResponse(thought=make_test_thought(), action=action),
+            AgentResponse(thought=make_test_thought(), action=finish_action),
+        ]
+    )
+
+    approval_manager = ApprovalManager()
+    runner = ControlledAgentRunner(
+        model_client=mock_model,
+        observer=mock_observer,
+        executor=mock_executor,
+        approval_manager=approval_manager,
+        events=mock_events,
+    )
+
+    observed_status_while_waiting = []
+
+    async def inspect_and_approve():
+        await asyncio.sleep(0.05)
+        if runner.current_state:
+            observed_status_while_waiting.append(runner.current_state.status)
+        pending = approval_manager.list_pending_requests()
+        if pending:
+            approval_manager.resolve_request(pending[0].approval_id, approved=True, reason="Operator confirmed")
+
+    asyncio.create_task(inspect_and_approve())
+    state = await runner.run(AgentRunRequest(goal="Pay bill", max_steps=5))
+
+    # Verify runner state was AWAITING_CONFIRMATION while suspended
+    assert RunStatus.AWAITING_CONFIRMATION in observed_status_while_waiting
+
+    # Check STATUS_CHANGE events
+    status_change_calls = [
+        call for call in mock_events.emit.call_args_list
+        if getattr(call[0][0], "value", call[0][0]) == EventType.STATUS_CHANGE.value
+    ]
+    statuses_emitted = [call[0][2].get("status") for call in status_change_calls]
+    assert RunStatus.AWAITING_CONFIRMATION.value in statuses_emitted
+    assert RunStatus.RUNNING.value in statuses_emitted
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runs_on_same_runner_instance_rejected():
+    """Verify that overlapping concurrent calls to run() on the same runner instance
+    raise RuntimeError via _run_lock.
+    """
+    mock_model = MagicMock(spec=OllamaModelClient)
+    mock_observer = MagicMock()
+    mock_executor = MagicMock()
+    mock_events = MagicMock()
+    mock_events.emit = AsyncMock()
+
+    obs = make_test_observation()
+    mock_observer.observe = AsyncMock(return_value=obs)
+    mock_executor.initialize = AsyncMock(return_value=MagicMock())
+
+    # Simulate slow model execution
+    async def slow_get_next_action(*args, **kwargs):
+        await asyncio.sleep(0.2)
+        return AgentResponse(thought=make_test_thought(), action=BrowserAction(action_type=ActionType.FINISH, description="Done"))
+
+    mock_model.get_next_action = AsyncMock(side_effect=slow_get_next_action)
+    runner = ControlledAgentRunner(
+        model_client=mock_model,
+        observer=mock_observer,
+        executor=mock_executor,
+    )
+
+    task1 = asyncio.create_task(runner.run(AgentRunRequest(goal="Task 1", max_steps=5)))
+    await asyncio.sleep(0.05)
+
+    with pytest.raises(RuntimeError, match="ControlledAgentRunner is already executing an active run"):
+        await runner.run(AgentRunRequest(goal="Task 2", max_steps=5))
+
+    await task1
+
+
+def test_completed_approval_records_pruned_by_retention_policy():
+    """Verify that bounded in-memory retention policy prunes old resolved requests
+    when capacity exceeds max_history_size, while preserving pending requests.
+    """
+    manager = ApprovalManager(max_history_size=5)
+    action = BrowserAction(action_type=ActionType.CLICK, selector="#btn-pay", description="Pay")
+
+    # Create and resolve 8 requests
+    for i in range(8):
+        req = manager.create_request(run_id=f"run-{i}", step_number=1, action=action, reason="Pay")
+        manager.resolve_request(req.approval_id, approved=True)
+
+    # Create 2 pending requests
+    pending1 = manager.create_request(run_id="run-p1", step_number=1, action=action, reason="Pending 1")
+    pending2 = manager.create_request(run_id="run-p2", step_number=1, action=action, reason="Pending 2")
+
+    # History size should be bounded and pending requests must NOT be pruned
+    assert len(manager._requests) <= 7  # 5 max history + 2 pending
+    assert pending1.approval_id in manager._requests
+    assert pending2.approval_id in manager._requests
+
+
+def test_deterministic_demo_model_client_protocol_and_safety_guardrails():
+    """Verify DeterministicDemoModelClient adheres to ModelClientProtocol, clearly identifies
+    demo fallback responses, and is subject to downstream safety classification.
+    """
+    demo_client = DeterministicDemoModelClient()
+    assert isinstance(demo_client, ModelClientProtocol)
+    assert isinstance(OllamaModelClient(), ModelClientProtocol)
+
+    obs = make_test_observation()
+    # Query destructive scenario
+    loop = asyncio.new_event_loop()
+    try:
+        resp = loop.run_until_complete(
+            demo_client.get_next_action(goal="Purge all records in database", observation=obs, step_number=1)
+        )
+        assert "[DEMO FALLBACK" in (resp.thought.reflection or "")
+        assert "[DEMO FALLBACK" in (resp.raw_model_response or "")
+
+        # Downstream safety classification must strictly block the demo response
+        decision = classify_action_safety(resp.action, obs)
+        assert decision.decision_type == SafetyDecisionType.BLOCK
+        assert decision.is_safe is False
+    finally:
+        loop.close()

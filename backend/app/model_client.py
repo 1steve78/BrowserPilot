@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
 import httpx
 from pydantic import ValidationError
@@ -30,6 +30,26 @@ from .schemas import (
     BrowserAction,
     PageObservation,
 )
+
+
+@runtime_checkable
+class ModelClientProtocol(Protocol):
+    """Protocol defining the standard interface for BrowserPilot model clients.
+
+    Adhered to by both OllamaModelClient (for live LLM inference) and
+    DeterministicDemoModelClient (for reproducible demo walkthroughs).
+    """
+
+    async def get_next_action(
+        self,
+        goal: str,
+        observation: PageObservation,
+        step_number: Optional[int] = None,
+        max_steps: int = 10,
+    ) -> AgentResponse:
+        """Query the model client for the next browser action given the goal and observation."""
+        ...
+
 
 MODEL_ENV_VAR = "BROWSERPILOT_MODEL"
 FALLBACK_ENV_VAR = "OLLAMA_MODEL"

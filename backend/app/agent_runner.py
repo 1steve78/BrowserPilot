@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import uuid
 
 from .approval import (
@@ -30,6 +30,7 @@ from .approval import (
     SafetyDecision,
     SafetyDecisionType,
     classify_action_safety,
+    resolve_target_element,
 )
 from .events import EventType, event_manager as default_event_manager, EventManager
 from .executor import PlaywrightExecutor
@@ -37,6 +38,7 @@ from .model_client import (
     ModelClientError,
     ModelConnectionError,
     ModelResponseParseError,
+    ModelClientProtocol,
     OllamaModelClient,
 )
 from .observer import PlaywrightObserver
@@ -310,7 +312,7 @@ class ControlledAgentRunner:
 
     def __init__(
         self,
-        model_client: Optional[OllamaModelClient] = None,
+        model_client: Optional[Union[ModelClientProtocol, OllamaModelClient]] = None,
         observer: Optional[PlaywrightObserver] = None,
         executor: Optional[PlaywrightExecutor] = None,
         safety: Optional[SafetyGuard] = None,
@@ -336,6 +338,7 @@ class ControlledAgentRunner:
         self._stop_requested = False
         self._current_run_id: Optional[str] = None
         self._current_state: Optional[AgentRunState] = None
+        self._run_lock = asyncio.Lock()
 
     def _record_trajectory_step(
         self,
@@ -391,7 +394,22 @@ class ControlledAgentRunner:
         page: Optional[Any] = None,
         task_id: Optional[str] = None,
     ) -> AgentRunState:
-        """Run the controlled cognitive loop until verification, limit, or failure."""
+        """Run the controlled cognitive loop until verification, limit, or failure.
+
+        Guarded by _run_lock to prevent overlapping concurrent executions on the same runner instance.
+        """
+        if self._run_lock.locked():
+            raise RuntimeError("ControlledAgentRunner is already executing an active run.")
+
+        async with self._run_lock:
+            return await self._run_impl(request, page=page, task_id=task_id)
+
+    async def _run_impl(
+        self,
+        request: AgentRunRequest,
+        page: Optional[Any] = None,
+        task_id: Optional[str] = None,
+    ) -> AgentRunState:
         run_id = str(uuid.uuid4())
         self._current_run_id = run_id
 
@@ -763,6 +781,19 @@ class ControlledAgentRunner:
                         },
                     )
 
+                    state.status = RunStatus.AWAITING_CONFIRMATION
+                    await self.events.emit(
+                        EventType.STATUS_CHANGE,
+                        f"Awaiting human approval for step {step_idx}: {decision.reason}",
+                        {
+                            "status": RunStatus.AWAITING_CONFIRMATION.value,
+                            "run_id": run_id,
+                            "step": step_idx,
+                            "approval_id": approval_req.approval_id,
+                        },
+                        run_id=run_id,
+                    )
+
                     await self.events.emit(
                         EventType.SAFETY_ALERT,
                         f"Approval required for step {step_idx}: {decision.reason}",
@@ -887,15 +918,103 @@ class ControlledAgentRunner:
                         break
 
                     elif approval_status == ApprovalStatus.APPROVED:
-                        is_valid = self.approval_manager.is_valid_for_execution(
+                        fresh_obs = observation
+                        # Re-observe page immediately after approval wait to verify context has not drifted.
+                        # (Skipped when auto_approve=True as resolution occurs synchronously without operator delay)
+                        if not self.auto_approve:
+                            try:
+                                fresh_obs = await self.observer.observe(active_page)
+                            except Exception as exc:
+                                stop_reason = StopReason.OBSERVER_ERROR
+                                state.status = RunStatus.FAILED
+                                state.error = f"Observation capture failed after approval at step {step_idx}: {exc}"
+                                step_rec = self._record_trajectory_step(
+                                    run_id=run_id,
+                                    task_id=task_id,
+                                    step_number=step_idx,
+                                    goal=request.goal,
+                                    observation=observation,
+                                    action=proposed_action,
+                                    grounding_valid=False,
+                                    safety_check=safety_check,
+                                    status=RunStatus.FAILED,
+                                    stop_reason=StopReason.OBSERVER_ERROR,
+                                    error=state.error,
+                                )
+                                if step_rec:
+                                    logged_steps.append(step_rec)
+                                await self.events.emit(
+                                    EventType.ERROR,
+                                    state.error,
+                                    {"step": step_idx, "error": str(exc)},
+                                    run_id=run_id,
+                                )
+                                break
+
+                            drift_detected = False
+                            drift_detail = ""
+                            if fresh_obs.url != observation.url:
+                                drift_detected = True
+                                drift_detail = f"Page URL navigated away during approval wait: '{observation.url}' -> '{fresh_obs.url}'."
+                            elif proposed_action.selector and not is_action_grounded(proposed_action, fresh_obs):
+                                drift_detected = True
+                                drift_detail = f"Target selector '{proposed_action.selector}' is no longer grounded after approval wait."
+                            elif proposed_action.selector:
+                                orig_elem = resolve_target_element(proposed_action, observation)
+                                fresh_elem = resolve_target_element(proposed_action, fresh_obs)
+                                if orig_elem is not None:
+                                    if fresh_elem is None:
+                                        drift_detected = True
+                                        drift_detail = "Target element was removed from page during approval wait."
+                                    elif (
+                                        (fresh_elem.text or "").strip() != (orig_elem.text or "").strip()
+                                        or (fresh_elem.aria_label or "").strip() != (orig_elem.aria_label or "").strip()
+                                    ):
+                                        drift_detected = True
+                                        drift_detail = (
+                                            f"Target element text/label mutated during approval wait: "
+                                            f"'{orig_elem.text}' -> '{fresh_elem.text}'."
+                                        )
+
+                            if drift_detected:
+                                stop_reason = StopReason.SAFETY_BLOCKED
+                                state.status = RunStatus.FAILED
+                                state.error = f"Page state drifted during approval wait (failing closed): {drift_detail}"
+                                step_rec = self._record_trajectory_step(
+                                    run_id=run_id,
+                                    task_id=task_id,
+                                    step_number=step_idx,
+                                    goal=request.goal,
+                                    observation=fresh_obs,
+                                    action=proposed_action,
+                                    grounding_valid=False,
+                                    safety_check=safety_check,
+                                    status=RunStatus.FAILED,
+                                    stop_reason=StopReason.SAFETY_BLOCKED,
+                                    error=state.error,
+                                )
+                                if step_rec:
+                                    logged_steps.append(step_rec)
+                                await self.events.emit(
+                                    EventType.SAFETY_ALERT,
+                                    state.error,
+                                    {"step": step_idx, "drift_detail": drift_detail},
+                                    run_id=run_id,
+                                )
+                                break
+
+                            observation = fresh_obs
+
+                        is_valid = await self.approval_manager.validate_and_consume(
                             approval_id=approval_req.approval_id,
+                            expected_run_id=run_id,
                             expected_action=proposed_action,
-                            is_run_active=(not self._stop_requested and state.status == RunStatus.RUNNING),
+                            is_run_active=(not self._stop_requested),
                         )
                         if not is_valid:
                             stop_reason = StopReason.SAFETY_BLOCKED
                             state.status = RunStatus.FAILED
-                            state.error = "Approval validation failed: action modified, run inactive, or stale request."
+                            state.error = "Approval validation failed: action modified, run inactive, stale request, or already consumed."
                             step_rec = self._record_trajectory_step(
                                 run_id=run_id,
                                 task_id=task_id,
@@ -911,8 +1030,22 @@ class ControlledAgentRunner:
                             )
                             if step_rec:
                                 logged_steps.append(step_rec)
+                            await self.events.emit(
+                                EventType.ERROR,
+                                state.error,
+                                {"approval_id": approval_req.approval_id, "step": step_idx},
+                                run_id=run_id,
+                            )
                             break
-                        self.approval_manager.consume_request(approval_req.approval_id)
+
+                        state.status = RunStatus.RUNNING
+                        observation = fresh_obs
+                        await self.events.emit(
+                            EventType.STATUS_CHANGE,
+                            f"Approval granted and validated for step {step_idx}: resuming execution",
+                            {"status": RunStatus.RUNNING.value, "run_id": run_id, "step": step_idx},
+                            run_id=run_id,
+                        )
                     else:
                         stop_reason = StopReason.SAFETY_BLOCKED
                         state.status = RunStatus.FAILED
