@@ -68,10 +68,19 @@
 
           <!-- Quick Workflow Presets Container -->
           <div class="form-group" id="presets-container">
-            <label>Quick Action Presets</label>
+            <label>Demo Scenarios & Action Presets</label>
             <div class="presets-toolbar">
               <button type="button" class="preset-btn active" id="preset-workflow" onclick="selectPreset('full-workflow')">
-                ⚡ Full Invoice Workflow
+                ⚡ Scenario 1: Find Invoice
+              </button>
+              <button type="button" class="preset-btn" id="preset-settings" onclick="selectPreset('scenario-2-settings')">
+                ⚙️ Scenario 2: Update Setting
+              </button>
+              <button type="button" class="preset-btn" id="preset-stop" onclick="selectPreset('scenario-3-stop')">
+                ⏹️ Scenario 3: Multi-Action (Stop Demo)
+              </button>
+              <button type="button" class="preset-btn" id="preset-injection" onclick="selectPreset('safety-injection')">
+                🛡️ Injection Defense Demo
               </button>
               <button type="button" class="preset-btn" onclick="selectPreset('nav-invoices')">
                 📂 Open Invoices

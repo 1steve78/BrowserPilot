@@ -436,6 +436,36 @@ const PRESETS = {
       { action: 'wait', target: 'invoice-detail-amount', wait_seconds: 2 },
     ],
   },
+  'scenario-2-settings': {
+    title: 'Update profile name in settings',
+    description: 'Scenario 2: Navigate to settings, change profile name to Sarah Connor, and save preferences',
+    steps: [
+      { action: 'navigate', url: 'index.html#settings' },
+      { action: 'type', target: 'settings-profile-name', text: 'Sarah Connor' },
+      { action: 'click', target: 'settings-save-btn' },
+      { action: 'wait', target: 'settings-save-success-msg', wait_seconds: 2 },
+    ],
+  },
+  'scenario-3-stop': {
+    title: 'Multi-action workflow sequence for Stop demonstration',
+    description: 'Scenario 3: Multi-step task sequence designed for demonstrating live Stop control',
+    steps: [
+      { action: 'navigate', url: 'index.html#dashboard' },
+      { action: 'scroll', scroll_delta_y: 200 },
+      { action: 'navigate', url: 'index.html#invoices' },
+      { action: 'type', target: 'invoice-search', text: 'INV-2026' },
+      { action: 'scroll', scroll_delta_y: 300 },
+      { action: 'navigate', url: 'index.html#settings' },
+    ],
+  },
+  'safety-injection': {
+    title: 'Prompt injection detection and security audit',
+    description: 'Security check: Navigate to injection lab and trigger prompt injection detection',
+    steps: [
+      { action: 'navigate', url: 'injection.html' },
+      { action: 'wait', target: 'injection-payload-text', wait_seconds: 2 },
+    ],
+  },
   'nav-invoices': {
     title: 'Navigate to invoices page',
     description: 'Open the mock invoices listing',

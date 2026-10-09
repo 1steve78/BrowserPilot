@@ -189,6 +189,23 @@ async def execute_action(request: ExecuteActionRequest):
                 )
             else:
                 result = await executor.execute(request)
+                if result.success and executor.current_page and not executor.current_page.is_closed():
+                    try:
+                        current_obs = await observer.observe(executor.current_page)
+                        injections = safety_guard.inspect_observation(current_obs)
+                        if injections:
+                            for inj in injections:
+                                await event_manager.emit(
+                                    EventType.SAFETY_ALERT,
+                                    message=f"Prompt injection detected on page: {inj.reason}",
+                                    data={
+                                        "reason": inj.reason,
+                                        "pattern": inj.flagged_pattern,
+                                        "url": executor.current_page.url,
+                                    },
+                                )
+                    except Exception:
+                        pass
 
         # Record event telemetry in event manager
         await event_manager.emit(

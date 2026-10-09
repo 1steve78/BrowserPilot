@@ -51,7 +51,7 @@
       <div class="sidebar-footer">
         <div class="user-avatar" id="sidebar-avatar">AM</div>
         <div class="user-info">
-          <div class="user-name" id="sidebar-user-name">Alex Morgan</div>
+          <div class="user-name" id="sidebar-user-name" data-agent-id="sidebar-user-name">Alex Morgan</div>
           <div class="user-role">Administrator</div>
         </div>
       </div>
@@ -594,6 +594,9 @@
              PAGE 3: SETTINGS
              =================================================================== -->
         <section class="page-view" id="view-settings">
+          <div id="settings-save-success-msg" data-agent-id="settings-save-success-msg" style="display: none; padding: 0.75rem 1rem; border-radius: 6px; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); color: #059669; font-weight: 500; margin-bottom: 1rem;">
+            Settings saved successfully!
+          </div>
           <form id="settings-form" onsubmit="saveSettings(event)">
             <div class="settings-grid">
               <!-- Profile Details Section -->
@@ -1168,6 +1171,12 @@
         document.getElementById('sidebar-avatar').textContent = initials;
       }
 
+      const successEl = document.getElementById('settings-save-success-msg');
+      if (successEl) {
+        successEl.style.display = 'block';
+        successEl.textContent = `Settings saved successfully! Updated name: ${name || 'Administrator'}.`;
+      }
+
       showToast(`Settings saved successfully! Updated preferences for ${name || 'Administrator'}.`, 'success');
     }
 
@@ -1189,6 +1198,10 @@
 
       document.getElementById('sidebar-user-name').textContent = 'Alex Morgan';
       document.getElementById('sidebar-avatar').textContent = 'AM';
+      const successEl = document.getElementById('settings-save-success-msg');
+      if (successEl) {
+        successEl.style.display = 'none';
+      }
       showToast('Settings restored to initial default values.', 'info');
     }
 
